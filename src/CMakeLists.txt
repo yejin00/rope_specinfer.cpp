@@ -29,6 +29,7 @@ add_library(llama
             llama-model-loader.cpp
             llama-model-saver.cpp
             llama-model.cpp
+            llama-crs-late.cpp
             llama-quant.cpp
             llama-sampling.cpp
             llama-vocab.cpp

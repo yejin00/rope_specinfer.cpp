@@ -474,6 +474,15 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     if (s == "q8_0") {
         return GGML_TYPE_Q8_0;
     }
+    if (s == "q2_0") {
+        return GGML_TYPE_Q2_0;
+    }
+    if (s == "q4_0_q2_0_head") {
+        return GGML_TYPE_Q4_0_Q2_0_HEAD;
+    }
+    if (s == "q2_0_q4_0_head") {
+        return GGML_TYPE_Q2_0_Q4_0_HEAD;
+    }
     if (s == "q4_0") {
         return GGML_TYPE_Q4_0;
     }

@@ -418,7 +418,11 @@ extern "C" {
         // GGML_TYPE_IQ4_NL_4_8 = 37,
         // GGML_TYPE_IQ4_NL_8_8 = 38,
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
-        GGML_TYPE_COUNT   = 40,
+        GGML_TYPE_Q4_0_HEAD = 40, // Q4_0 with block size 128 (per-head KV cache quantization)
+        GGML_TYPE_Q2_0    = 41,   // Q2_0 with block size 32
+        GGML_TYPE_Q4_0_Q2_0_HEAD = 42, // mixed KV cache: first 64 dims q4_0, last 64 dims q2_0
+        GGML_TYPE_Q2_0_Q4_0_HEAD = 43, // mixed KV cache: first 64 dims q2_0, last 64 dims q4_0
+        GGML_TYPE_COUNT   = 44,
     };
 
     // precision
@@ -504,6 +508,7 @@ extern "C" {
         GGML_OP_GET_ROWS,
         GGML_OP_GET_ROWS_BACK,
         GGML_OP_SET_ROWS,
+        GGML_OP_CRS_SPARSE_MUL,
         GGML_OP_DIAG,
         GGML_OP_DIAG_MASK_INF,
         GGML_OP_DIAG_MASK_ZERO,
@@ -1654,6 +1659,17 @@ extern "C" {
             struct ggml_tensor  * a,  // destination
             struct ggml_tensor  * b,  // source
             struct ggml_tensor  * c); // row indices
+
+    // a TD  [n_dim, n_head, n_tok, 1]
+    // b I32 [top_k, n_head, 1,     1]  // selected dim indices per head
+    // c F32 [top_k, n_head, 1,     1]  // selected scale values per head
+    //
+    // in-place view(a): for each token/head, multiply only a[b[k, h], h, t] by c[k, h]
+    GGML_API struct ggml_tensor * ggml_crs_sparse_mul_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * c);
 
     GGML_API struct ggml_tensor * ggml_diag(
         struct ggml_context     * ctx,

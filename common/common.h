@@ -240,6 +240,9 @@ struct common_params_speculative {
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
+    std::string crs_scales_k;              // CRS scales file for K cache (static outliers)
+    int32_t     crs_online_top_k = 0;      // Online CRS top-k (0 = disabled)
+
     struct cpu_params cpuparams;
     struct cpu_params cpuparams_batch;
 
@@ -378,6 +381,7 @@ struct common_params {
     int32_t ppl_output_type = 0;     // = 0 -> ppl output is as usual, = 1 -> ppl output is num_tokens, ppl, one per line
                                      //                                       (which is more convenient to use for plotting)
                                      //
+    bool    ppl_full_chunk  = false; // evaluate perplexity over the full context chunk (HF/RotateKV-style) instead of only the last half-window
     bool   hellaswag        = false; // compute HellaSwag score over random tasks from datafile supplied in prompt
     size_t hellaswag_tasks  = 400;   // number of tasks to use when computing the HellaSwag score
 
@@ -406,6 +410,7 @@ struct common_params {
     bool ctx_shift         = false; // context shift on infinite text generation
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
+    bool pre_rope          = false; // store K before RoPE, apply RoPE at attention time
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool use_mmap          = true;  // use mmap for faster loads
@@ -423,6 +428,9 @@ struct common_params {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+
+    std::string crs_scales_k;              // CRS scales file for K cache (static outliers)
+    int32_t     crs_online_top_k = 0;      // Online CRS top-k (0 = disabled)
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

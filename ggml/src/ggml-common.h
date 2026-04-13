@@ -93,8 +93,14 @@ typedef sycl::half2 ggml_half2;
 // QR = QK / number of values before dequantization
 // QI = number of 32 bit integers before dequantization
 
+#define QI2_0 2
+#define QR2_0 2
+
 #define QI4_0 (QK4_0 / (4 * QR4_0))
 #define QR4_0 2
+
+#define QI4_0_HEAD (QK4_0_HEAD / (4 * QR4_0_HEAD))
+#define QR4_0_HEAD 2
 
 #define QI4_1 (QK4_1 / (4 * QR4_1))
 #define QR4_1 2
@@ -167,12 +173,41 @@ typedef sycl::half2 ggml_half2;
 #define GGML_EXTENSION __extension__
 #endif // _MSC_VER
 
+#define QK2_0 32
+typedef struct {
+    ggml_half d;           // delta
+    uint8_t qs[QK2_0 / 4]; // 2-bit quants, 4 values per byte
+} block_q2_0;
+static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
+
 #define QK4_0 32
 typedef struct {
     ggml_half d;           // delta
     uint8_t qs[QK4_0 / 2]; // nibbles / quants
 } block_q4_0;
 static_assert(sizeof(block_q4_0) == sizeof(ggml_half) + QK4_0 / 2, "wrong q4_0 block size/padding");
+
+#define QK4_0_HEAD 128
+typedef struct {
+    ggml_half d;                  // delta
+    uint8_t qs[QK4_0_HEAD / 2];   // nibbles / quants
+} block_q4_0_head;
+static_assert(sizeof(block_q4_0_head) == sizeof(ggml_half) + QK4_0_HEAD / 2, "wrong q4_0_head block size/padding");
+
+#define QK4_0_Q2_0_HEAD 128
+#define QR4_0_Q2_0_HEAD 2
+#define QI4_0_Q2_0_HEAD (QK4_0_Q2_0_HEAD / (4 * QR4_0_Q2_0_HEAD))
+typedef struct {
+    block_q4_0 q4[2];
+    block_q2_0 q2[2];
+} block_q4_0_q2_0_head;
+static_assert(sizeof(block_q4_0_q2_0_head) == 2*sizeof(block_q4_0) + 2*sizeof(block_q2_0), "wrong q4_0_q2_0_head block size/padding");
+
+typedef struct {
+    block_q2_0 q2[2];
+    block_q4_0 q4[2];
+} block_q2_0_q4_0_head;
+static_assert(sizeof(block_q2_0_q4_0_head) == 2*sizeof(block_q2_0) + 2*sizeof(block_q4_0), "wrong q2_0_q4_0_head block size/padding");
 
 #define QK4_1 32
 typedef struct {

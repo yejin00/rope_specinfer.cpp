@@ -15,10 +15,34 @@ struct ggml_cgraph;
 struct ggml_context;
 struct ggml_tensor;
 
+// Dump callback for K activations (post-RoPE, used with DUMP_PREFIX)
+void dump_k_callback(struct ggml_tensor * dst, const struct ggml_tensor * src, int ith, int nth, void * userdata);
+
+// Pre-RoPE K value collection (memory accumulate + atexit dump)
+// Env: ROPE_DIST_VALUES_PATH, ROPE_DIST_TOKENS
+void rope_dist_init_if_needed(int64_t n_layers, int64_t n_heads, int64_t head_dim);
+void rope_dist_update_pre(int layer, const float * data, int64_t n_head, int64_t head_dim, int64_t n_tokens);
+void rope_dist_update_post(int layer, const float * data, int64_t n_head, int64_t head_dim, int64_t n_tokens);
+void rope_dist_advance_tokens(int64_t n_tokens);
+
+// Final-QK collection for logit preservation analysis.
+// Q is typically sampled, K is typically collected densely.
+// Env:
+//   QK_DIST_Q_PATH
+//   QK_DIST_K_PATH
+//   QK_DIST_MAX_TOKENS
+//   QK_DIST_Q_PREFIX_TOKENS / QK_DIST_Q_STRIDE
+//   QK_DIST_K_PREFIX_TOKENS / QK_DIST_K_STRIDE
+void qk_dist_q_init_if_needed(int64_t n_layers, int64_t n_heads, int64_t head_dim);
+void qk_dist_k_init_if_needed(int64_t n_layers, int64_t n_heads, int64_t head_dim);
+void qk_dist_q_update(int layer, const float * data, int64_t n_head, int64_t head_dim, int64_t n_tokens);
+void qk_dist_k_update(int layer, const float * data, int64_t n_head, int64_t head_dim, int64_t n_tokens);
+
 struct llama_cparams;
 
 struct llama_memory_context_i;
 
+class llama_kv_cache;
 class llama_kv_cache_context;
 class llama_kv_cache_iswa_context;
 class llama_memory_recurrent_context;
@@ -127,6 +151,33 @@ public:
     ggml_tensor * pos = nullptr; // I32 [n_batch]
 
     const uint32_t n_pos_per_embd = 1;
+};
+
+// positions for cached K entries (used by pre-rope)
+class llm_graph_input_k_cache_pos : public llm_graph_input_i {
+public:
+    llm_graph_input_k_cache_pos(
+            const llama_hparams & hparams,
+            const llama_cparams & cparams,
+            const llama_kv_cache * kv_cache,
+            uint32_t n_kv,
+            uint32_t n_pos_per_embd) :
+        hparams(hparams),
+        cparams(cparams),
+        kv_cache(kv_cache),
+        n_kv(n_kv),
+        n_pos_per_embd(n_pos_per_embd) {}
+    virtual ~llm_graph_input_k_cache_pos() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * pos = nullptr; // I32 [n_kv * n_pos_per_embd]
+
+    const llama_hparams & hparams;
+    const llama_cparams & cparams;
+    const llama_kv_cache * kv_cache;
+    const uint32_t n_kv;
+    const uint32_t n_pos_per_embd;
 };
 
 // temperature tuning, used by llama4
@@ -736,7 +787,10 @@ struct llm_graph_context {
             ggml_tensor * sinks, // [n_head_q]
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * rope_factors = nullptr) const;
+
+    ggml_tensor * build_inp_k_cache_pos(const llama_kv_cache * kv_cache, uint32_t n_kv, uint32_t n_stream) const;
 
     llm_graph_input_attn_kv_iswa * build_attn_inp_kv_iswa() const;
 

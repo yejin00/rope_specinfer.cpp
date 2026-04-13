@@ -1,0 +1,10 @@
+--- src/CMakeLists.txt.orig
++++ src/CMakeLists.txt
+@@ -37,6 +37,7 @@
+     llama-model.cpp
+     llama-model-loader.cpp
+     llama-model-saver.cpp
++    llama-crs-late.cpp
+     llama-quant.cpp
+     llama-sampling.cpp
+     llama-vocab.cpp

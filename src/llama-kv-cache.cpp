@@ -5,6 +5,11 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+// CRS (Channel-wise Row Scaling) for KV cache quantization
+extern "C" {
+    #include "../ggml/src/ggml-cpu/crs-scales.h"
+}
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -12,6 +17,53 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+
+// CRS custom operation parameters
+struct crs_op_params {
+    int32_t layer;
+    int32_t n_head;
+    int32_t n_embd_head;
+};
+
+// CRS custom operation: applies static CRS scaling to K before quantization
+static void crs_scale_op(struct ggml_tensor * dst, const struct ggml_tensor * src, int ith, int nth, void * userdata) {
+    GGML_UNUSED(ith);
+    GGML_UNUSED(nth);
+    
+    const crs_op_params * params = (const crs_op_params *)userdata;
+    if (!params || !g_crs_static.enabled) {
+        // No CRS - just copy
+        memcpy(dst->data, src->data, ggml_nbytes(src));
+        return;
+    }
+    
+    const int layer = params->layer;
+    const int n_head = params->n_head;
+    const int n_embd_head = params->n_embd_head;
+    
+    // src shape: [n_embd_gqa, n_tokens] where n_embd_gqa = n_embd_head * n_head
+    const int64_t n_embd_gqa = src->ne[0];
+    const int64_t n_tokens = src->ne[1];
+    
+    const float * src_data = (const float *)src->data;
+    float * dst_data = (float *)dst->data;
+    
+    // Apply CRS scaling per head, per channel
+    for (int64_t t = 0; t < n_tokens; t++) {
+        for (int h = 0; h < n_head; h++) {
+            for (int d = 0; d < n_embd_head; d++) {
+                int64_t idx = t * n_embd_gqa + h * n_embd_head + d;
+                float scale = crs_get_static_scale(layer, h, d);
+                
+                if (scale > 1e-6f) {
+                    dst_data[idx] = src_data[idx] / scale;
+                } else {
+                    dst_data[idx] = src_data[idx];
+                }
+            }
+        }
+    }
+}
 
 //
 // llama_kv_cache
@@ -1059,6 +1111,15 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
 
     k_cur = ggml_view_2d(ctx, k_cur, n_embd_gqa, n_tokens, k_cur->nb[2], 0);
 
+    // Apply CRS (Channel-wise Row Scaling) if enabled
+    // This scales down outlier channels before quantization
+    if (g_crs_static.enabled) {
+        // Allocate params on heap - will leak but acceptable for now
+        crs_op_params * crs_params = new crs_op_params{il, (int32_t)n_head, (int32_t)n_embd_head};
+        k_cur = ggml_map_custom1(ctx, k_cur, crs_scale_op, GGML_N_TASKS_MAX, crs_params);
+        ggml_format_name(k_cur, "k_crs_scaled_l%d", il);
+    }
+
     const int64_t n_stream = k->ne[2];
 
     if (n_stream > 1) {
@@ -1216,6 +1277,29 @@ void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
 
         for (uint32_t i = 0; i < cells.size(); ++i) {
             data[s*cells.size() + i] = cells.is_empty(i) ? 0 : cells.get_shift(i);
+        }
+    }
+}
+
+void llama_kv_cache::set_input_k_cache_pos(ggml_tensor * dst, uint32_t n_kv, uint32_t n_pos_per_embd) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+
+    llama_pos * data = (llama_pos *) dst->data;
+
+    // Derive actual stream count from tensor size
+    const uint32_t ns = (n_kv > 0 && n_pos_per_embd > 0)
+        ? (uint32_t)(dst->ne[0] / ((int64_t)n_kv * n_pos_per_embd))
+        : 1;
+
+    for (uint32_t s = 0; s < ns; ++s) {
+        const auto & cells = v_cells[std::min(s, (uint32_t)v_cells.size() - 1)];
+
+        for (uint32_t i = 0; i < n_kv; ++i) {
+            llama_pos p0 = (i < cells.size() && !cells.is_empty(i)) ? cells.pos_get(i) : -1;
+            const uint32_t base = (s * n_kv + i) * n_pos_per_embd;
+            for (uint32_t j = 0; j < n_pos_per_embd; ++j) {
+                data[base + j] = p0;
+            }
         }
     }
 }
@@ -1444,27 +1528,31 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
     const auto & cparams = lctx->get_cparams();
 
-    for (const auto & layer : layers) {
-        const uint32_t il = layer.il;
+    // Pre-RoPE: K is stored without RoPE, so no need to apply RoPE shift to cached K.
+    // The position metadata is still updated by the cells, and RoPE is applied at attention time.
+    if (!cparams.pre_rope) {
+        for (const auto & layer : layers) {
+            const uint32_t il = layer.il;
 
-        const int64_t n_head_kv    = hparams.n_head_kv(il);
-        const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
+            const int64_t n_head_kv    = hparams.n_head_kv(il);
+            const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
 
-        const float freq_base_l  = model.get_rope_freq_base (cparams, il);
-        const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
+            const float freq_base_l  = model.get_rope_freq_base (cparams, il);
+            const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
 
-        ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
+            ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
 
-        ggml_tensor * k =
-            ggml_view_3d(ctx, layer.k,
-                n_embd_head_k, n_head_kv, get_size()*n_stream,
-                ggml_row_size(layer.k->type, n_embd_head_k),
-                ggml_row_size(layer.k->type, n_embd_k_gqa),
-                0);
+            ggml_tensor * k =
+                ggml_view_3d(ctx, layer.k,
+                    n_embd_head_k, n_head_kv, get_size()*n_stream,
+                    ggml_row_size(layer.k->type, n_embd_head_k),
+                    ggml_row_size(layer.k->type, n_embd_k_gqa),
+                    0);
 
-        ggml_tensor * cur = build_rope_shift(cparams, ctx, k, inp->k_shift, rope_factors, freq_base_l, freq_scale_l);
+            ggml_tensor * cur = build_rope_shift(cparams, ctx, k, inp->k_shift, rope_factors, freq_base_l, freq_scale_l);
 
-        ggml_build_forward_expand(gf, cur);
+            ggml_build_forward_expand(gf, cur);
+        }
     }
 
     res->add_input(std::move(inp));
@@ -2033,6 +2121,10 @@ ggml_tensor * llama_kv_cache_context::build_input_v_idxs(ggml_context * ctx, con
 
 void llama_kv_cache_context::set_input_k_shift(ggml_tensor * dst) const {
     kv->set_input_k_shift(dst);
+}
+
+const llama_kv_cache * llama_kv_cache_context::get_kv_cache() const {
+    return kv;
 }
 
 void llama_kv_cache_context::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {

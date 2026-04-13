@@ -9,9 +9,619 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-recurrent.h"
 
+// CRS (Channel-wise Row Scaling) for KV cache quantization
+extern "C" {
+    #include "../ggml/src/ggml-cpu/crs-scales.h"
+}
+
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+#include <string>
+#include <mutex>
+
+static std::mutex g_dump_mutex;
+
+// Dump callback
+void dump_k_callback(struct ggml_tensor * dst, const struct ggml_tensor * src, int ith, int nth, void * userdata) {
+    // Identity copy (src -> dst)
+    memcpy(dst->data, src->data, ggml_nbytes(src));
+
+    // Only dump if environment variable is set
+    static const char * dump_prefix = std::getenv("DUMP_PREFIX");
+    if (!dump_prefix) return;
+
+    int il = (int)(intptr_t)userdata;
+
+    // We assume input is F32 (which is usually true for k_cur before RoPE or cache)
+    // k_cur shape: [n_embd_head, n_head, n_tokens]
+    // Check type: Support F32, F16, BF16
+    if (src->type != GGML_TYPE_F32 && src->type != GGML_TYPE_F16 && src->type != GGML_TYPE_BF16) {
+        if (il == 0 && ith == 0) {
+            fprintf(stderr, "[DUMP_DEBUG] Layer %d: Unsupported type %d\n", il, src->type);
+        }
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_dump_mutex);
+    
+    char filename[256];
+    snprintf(filename, sizeof(filename), "%s_layer_%d.bin", dump_prefix, il);
+    
+    FILE * f = fopen(filename, "ab");
+    if (f) {
+        if (src->type == GGML_TYPE_F32) {
+            fwrite(src->data, 1, ggml_nbytes(src), f);
+        } else if (src->type == GGML_TYPE_F16) {
+            int64_t ne = ggml_nelements(src);
+            std::vector<float> buf(ne);
+            ggml_fp16_to_fp32_row((const ggml_fp16_t *)src->data, buf.data(), ne);
+            fwrite(buf.data(), 1, ne * sizeof(float), f);
+        } else if (src->type == GGML_TYPE_BF16) {
+            int64_t ne = ggml_nelements(src);
+            std::vector<float> buf(ne);
+            ggml_bf16_to_fp32_row((const ggml_bf16_t *)src->data, buf.data(), ne);
+            fwrite(buf.data(), 1, ne * sizeof(float), f);
+        }
+        fclose(f);
+        
+        static bool printed = false;
+        if (!printed && il == 0) {
+            fprintf(stderr, "[DUMP] Appended %ld elements to %s (Type: %s)\n", 
+                (long)ggml_nelements(src), filename, ggml_type_name(src->type));
+            printed = true;
+        }
+    }
+}
+
+// ============================================================================
+// Pre-RoPE K value collection system (memory accumulate + atexit dump)
+// Environment variables:
+//   ROPE_DIST_VALUES_PATH - output file path
+//   ROPE_DIST_TOKENS      - max tokens to collect (default: 200000)
+// ============================================================================
+
+struct rope_dist_values {
+    std::vector<float> pre_values;   // [token * head * dim] flattened
+    std::vector<float> post_values;  // [token * head * dim] flattened
+};
+
+static std::vector<rope_dist_values> g_rope_dist_values;  // [layer]
+static std::vector<std::mutex> g_rope_dist_values_mtx;
+static bool g_rope_dist_collect_values = false;
+static const char * g_rope_dist_values_path = nullptr;
+static int64_t g_rope_dist_layers = 0;
+static int64_t g_rope_dist_heads = 0;
+static int64_t g_rope_dist_dims = 0;
+static int64_t g_rope_dist_max_tokens = 200000;        // total budget
+static int64_t g_rope_dist_max_tokens_per_layer = 0;   // = max_tokens / n_layers
+static std::vector<int64_t> g_rope_dist_layer_token_count; // per-layer collected count
+static int64_t g_rope_dist_token_count = 0;            // global (for header)
+static bool g_rope_dist_inited = false;
+
+static void rope_dist_dump_values() {
+    if (!g_rope_dist_collect_values || !g_rope_dist_values_path) {
+        return;
+    }
+
+    FILE * fp = fopen(g_rope_dist_values_path, "wb");
+    if (!fp) {
+        fprintf(stderr, "rope_dist_dump_values: failed to open %s\n", g_rope_dist_values_path);
+        return;
+    }
+
+    const uint32_t magic = 0x524F5056;  // 'ROPV'
+    const uint32_t version = 1;
+    const uint32_t layers = (uint32_t) g_rope_dist_layers;
+    const uint32_t heads = (uint32_t) g_rope_dist_heads;
+    const uint32_t dims = (uint32_t) g_rope_dist_dims;
+    const uint32_t tokens = (uint32_t) g_rope_dist_token_count;
+
+    fwrite(&magic,   sizeof(magic),   1, fp);
+    fwrite(&version, sizeof(version), 1, fp);
+    fwrite(&layers,  sizeof(layers),  1, fp);
+    fwrite(&heads,   sizeof(heads),   1, fp);
+    fwrite(&dims,    sizeof(dims),    1, fp);
+    fwrite(&tokens,  sizeof(tokens),  1, fp);
+
+    for (size_t layer = 0; layer < g_rope_dist_values.size(); ++layer) {
+        const auto & v = g_rope_dist_values[layer];
+        uint32_t pre_count = (uint32_t) v.pre_values.size();
+        fwrite(&pre_count, sizeof(uint32_t), 1, fp);
+        if (pre_count > 0) {
+            fwrite(v.pre_values.data(), sizeof(float), pre_count, fp);
+        }
+        uint32_t post_count = (uint32_t) v.post_values.size();
+        fwrite(&post_count, sizeof(uint32_t), 1, fp);
+        if (post_count > 0) {
+            fwrite(v.post_values.data(), sizeof(float), post_count, fp);
+        }
+    }
+
+    fclose(fp);
+    fprintf(stderr, "rope_dist_dump_values: saved to %s (layers=%d, heads=%d, dims=%d, tokens=%d)\n",
+            g_rope_dist_values_path, layers, heads, dims, tokens);
+}
+
+void rope_dist_init_if_needed(int64_t n_layers, int64_t n_heads, int64_t head_dim) {
+    if (g_rope_dist_inited) {
+        return;
+    }
+    g_rope_dist_inited = true;
+
+    const char * values_path = getenv("ROPE_DIST_VALUES_PATH");
+    if (!values_path || values_path[0] == '\0') {
+        return;
+    }
+
+    int64_t layers = n_layers;
+    int64_t heads = n_heads;
+    int64_t dims = head_dim;
+
+    const char * s_tokens = getenv("ROPE_DIST_TOKENS");
+    if (s_tokens && s_tokens[0]) {
+        g_rope_dist_max_tokens = atoll(s_tokens);
+    }
+
+    if (layers <= 0 || heads <= 0 || dims <= 0) {
+        return;
+    }
+
+    g_rope_dist_layers = layers;
+    g_rope_dist_heads = heads;
+    g_rope_dist_dims = dims;
+
+    g_rope_dist_max_tokens_per_layer = g_rope_dist_max_tokens / layers;
+    if (g_rope_dist_max_tokens_per_layer < 1) g_rope_dist_max_tokens_per_layer = 1;
+
+    g_rope_dist_collect_values = true;
+    g_rope_dist_values_path = values_path;
+    g_rope_dist_values.resize(layers);
+    g_rope_dist_values_mtx = std::vector<std::mutex>((size_t)layers);
+    g_rope_dist_layer_token_count.resize(layers, 0);
+
+    atexit(rope_dist_dump_values);
+
+    fprintf(stderr, "rope_dist_values: enabled (path=%s, layers=%ld, heads=%ld, dims=%ld, total_budget=%ld, per_layer=%ld)\n",
+            values_path, (long)layers, (long)heads, (long)dims, (long)g_rope_dist_max_tokens, (long)g_rope_dist_max_tokens_per_layer);
+}
+
+void rope_dist_update_pre(int layer, const float * data, int64_t n_head, int64_t head_dim, int64_t n_tokens) {
+    if (!g_rope_dist_collect_values) return;
+    if (layer < 0 || layer >= g_rope_dist_layers) return;
+
+    const int64_t heads_to_track = std::min(n_head, g_rope_dist_heads);
+    const int64_t dims_to_track = std::min(head_dim, g_rope_dist_dims);
+    const int64_t stride = heads_to_track * dims_to_track;
+    const int64_t max_elems = g_rope_dist_max_tokens_per_layer * stride;
+
+    std::lock_guard<std::mutex> lock(g_rope_dist_values_mtx[layer]);
+    auto & v = g_rope_dist_values[layer];
+
+    if ((int64_t)v.pre_values.size() >= max_elems) return;
+
+    for (int64_t t = 0; t < n_tokens && (int64_t)v.pre_values.size() < max_elems; ++t) {
+        for (int64_t h = 0; h < heads_to_track; ++h) {
+            for (int64_t d = 0; d < dims_to_track; ++d) {
+                float val = data[t * n_head * head_dim + h * head_dim + d];
+                v.pre_values.push_back(val);
+            }
+        }
+    }
+    if (layer == 0) {
+        g_rope_dist_layer_token_count[0] = (int64_t)v.pre_values.size() / stride;
+    }
+}
+
+void rope_dist_update_post(int layer, const float * data, int64_t n_head, int64_t head_dim, int64_t n_tokens) {
+    if (!g_rope_dist_collect_values) return;
+    if (layer < 0 || layer >= g_rope_dist_layers) return;
+
+    const int64_t heads_to_track = std::min(n_head, g_rope_dist_heads);
+    const int64_t dims_to_track = std::min(head_dim, g_rope_dist_dims);
+    const int64_t stride = heads_to_track * dims_to_track;
+    const int64_t max_elems = g_rope_dist_max_tokens_per_layer * stride;
+
+    std::lock_guard<std::mutex> lock(g_rope_dist_values_mtx[layer]);
+    auto & v = g_rope_dist_values[layer];
+
+    if ((int64_t)v.post_values.size() >= max_elems) return;
+
+    for (int64_t t = 0; t < n_tokens && (int64_t)v.post_values.size() < max_elems; ++t) {
+        for (int64_t h = 0; h < heads_to_track; ++h) {
+            for (int64_t d = 0; d < dims_to_track; ++d) {
+                float val = data[t * n_head * head_dim + h * head_dim + d];
+                v.post_values.push_back(val);
+            }
+        }
+    }
+}
+
+void rope_dist_advance_tokens(int64_t n_tokens) {
+    if (g_rope_dist_collect_values) {
+        g_rope_dist_token_count += n_tokens;
+    }
+    // no-op: per-layer counting is done inside rope_dist_update_pre
+}
+
+// ============================================================================
+// Final Q/K collection system for QK logit analysis.
+// Q is usually sampled, K is usually dense.
+// ============================================================================
+
+struct qk_dist_layer_values {
+    std::vector<uint32_t> positions; // absolute token indices in collection order
+    std::vector<float> values;       // [sample * head * dim] flattened
+};
+
+struct qk_dist_state {
+    bool enabled = false;
+    bool inited = false;
+    const char * path = nullptr;
+    const char * label = nullptr;
+    int64_t layers = 0;
+    int64_t heads = 0;
+    int64_t dims = 0;
+    int64_t max_tokens = 200000;
+    int64_t prefix_tokens = 0;
+    int64_t stride = 1;
+    std::vector<qk_dist_layer_values> layer_values;
+    std::vector<std::mutex> layer_mtx;
+    std::vector<int64_t> layer_seen_tokens;
+};
+
+static qk_dist_state g_qk_dist_q;
+static qk_dist_state g_qk_dist_k;
+static bool g_qk_dist_dump_registered = false;
+
+static bool qk_dist_should_keep_token(int64_t abs_token, int64_t max_tokens, int64_t prefix_tokens, int64_t stride) {
+    if (abs_token < 0 || abs_token >= max_tokens) {
+        return false;
+    }
+    if (abs_token < prefix_tokens) {
+        return true;
+    }
+    if (stride <= 0) {
+        return false;
+    }
+    return ((abs_token - prefix_tokens) % stride) == 0;
+}
+
+static void qk_dist_dump_state(const qk_dist_state & state) {
+    if (!state.enabled || !state.path) {
+        return;
+    }
+
+    FILE * fp = fopen(state.path, "wb");
+    if (!fp) {
+        fprintf(stderr, "qk_dist_dump_state: failed to open %s\n", state.path);
+        return;
+    }
+
+    const uint32_t magic = 0x41435456; // 'ACTV'
+    const uint32_t version = 1;
+    const uint32_t layers = (uint32_t) state.layers;
+    const uint32_t heads = (uint32_t) state.heads;
+    const uint32_t dims = (uint32_t) state.dims;
+
+    fwrite(&magic, sizeof(magic), 1, fp);
+    fwrite(&version, sizeof(version), 1, fp);
+    fwrite(&layers, sizeof(layers), 1, fp);
+    fwrite(&heads, sizeof(heads), 1, fp);
+    fwrite(&dims, sizeof(dims), 1, fp);
+
+    size_t total_samples = 0;
+    for (size_t layer = 0; layer < state.layer_values.size(); ++layer) {
+        const auto & v = state.layer_values[layer];
+        const uint32_t sample_count = (uint32_t) v.positions.size();
+        const uint32_t value_count = (uint32_t) v.values.size();
+
+        fwrite(&sample_count, sizeof(sample_count), 1, fp);
+        if (sample_count > 0) {
+            fwrite(v.positions.data(), sizeof(uint32_t), sample_count, fp);
+        }
+
+        fwrite(&value_count, sizeof(value_count), 1, fp);
+        if (value_count > 0) {
+            fwrite(v.values.data(), sizeof(float), value_count, fp);
+        }
+
+        total_samples += sample_count;
+    }
+
+    fclose(fp);
+    fprintf(stderr,
+            "qk_dist_dump_state: saved %s to %s (layers=%d, heads=%d, dims=%d, samples=%zu)\n",
+            state.label ? state.label : "activations",
+            state.path,
+            layers,
+            heads,
+            dims,
+            total_samples);
+}
+
+static void qk_dist_dump_all() {
+    qk_dist_dump_state(g_qk_dist_q);
+    qk_dist_dump_state(g_qk_dist_k);
+}
+
+static void qk_dist_init_state(
+        qk_dist_state & state,
+        const char * path_env,
+        const char * label,
+        int64_t n_layers,
+        int64_t n_heads,
+        int64_t head_dim,
+        int64_t default_prefix_tokens,
+        int64_t default_stride,
+        const char * prefix_env,
+        const char * stride_env) {
+    if (state.inited) {
+        return;
+    }
+    state.inited = true;
+
+    const char * path = getenv(path_env);
+    if (!path || path[0] == '\0') {
+        return;
+    }
+
+    state.path = path;
+    state.label = label;
+    state.layers = n_layers;
+    state.heads = n_heads;
+    state.dims = head_dim;
+    state.prefix_tokens = default_prefix_tokens;
+    state.stride = default_stride;
+
+    const char * s_max_tokens = getenv("QK_DIST_MAX_TOKENS");
+    if (s_max_tokens && s_max_tokens[0]) {
+        state.max_tokens = atoll(s_max_tokens);
+    }
+
+    const char * s_prefix = getenv(prefix_env);
+    if (s_prefix && s_prefix[0]) {
+        state.prefix_tokens = atoll(s_prefix);
+    }
+
+    const char * s_stride = getenv(stride_env);
+    if (s_stride && s_stride[0]) {
+        state.stride = atoll(s_stride);
+    }
+
+    state.enabled = true;
+    state.layer_values.resize((size_t) n_layers);
+    state.layer_mtx = std::vector<std::mutex>((size_t) n_layers);
+    state.layer_seen_tokens.resize((size_t) n_layers, 0);
+
+    if (!g_qk_dist_dump_registered) {
+        atexit(qk_dist_dump_all);
+        g_qk_dist_dump_registered = true;
+    }
+
+    fprintf(stderr,
+            "qk_dist: enabled %s (path=%s, layers=%ld, heads=%ld, dims=%ld, max_tokens=%ld, prefix=%ld, stride=%ld)\n",
+            label,
+            path,
+            (long) n_layers,
+            (long) n_heads,
+            (long) head_dim,
+            (long) state.max_tokens,
+            (long) state.prefix_tokens,
+            (long) state.stride);
+}
+
+static void qk_dist_update_state(
+        qk_dist_state & state,
+        int layer,
+        const float * data,
+        int64_t n_head,
+        int64_t head_dim,
+        int64_t n_tokens) {
+    if (!state.enabled) {
+        return;
+    }
+    if (layer < 0 || layer >= state.layers) {
+        return;
+    }
+
+    const int64_t heads_to_track = std::min(n_head, state.heads);
+    const int64_t dims_to_track = std::min(head_dim, state.dims);
+
+    std::lock_guard<std::mutex> lock(state.layer_mtx[(size_t) layer]);
+    auto & v = state.layer_values[(size_t) layer];
+    auto & seen = state.layer_seen_tokens[(size_t) layer];
+
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        const int64_t abs_token = seen++;
+        if (!qk_dist_should_keep_token(abs_token, state.max_tokens, state.prefix_tokens, state.stride)) {
+            continue;
+        }
+
+        v.positions.push_back((uint32_t) abs_token);
+        for (int64_t h = 0; h < heads_to_track; ++h) {
+            for (int64_t d = 0; d < dims_to_track; ++d) {
+                const float val = data[t * n_head * head_dim + h * head_dim + d];
+                v.values.push_back(val);
+            }
+        }
+    }
+}
+
+void qk_dist_q_init_if_needed(int64_t n_layers, int64_t n_heads, int64_t head_dim) {
+    qk_dist_init_state(
+            g_qk_dist_q,
+            "QK_DIST_Q_PATH",
+            "Q samples",
+            n_layers,
+            n_heads,
+            head_dim,
+            16,
+            128,
+            "QK_DIST_Q_PREFIX_TOKENS",
+            "QK_DIST_Q_STRIDE");
+}
+
+void qk_dist_k_init_if_needed(int64_t n_layers, int64_t n_heads, int64_t head_dim) {
+    qk_dist_init_state(
+            g_qk_dist_k,
+            "QK_DIST_K_PATH",
+            "K samples",
+            n_layers,
+            n_heads,
+            head_dim,
+            0,
+            1,
+            "QK_DIST_K_PREFIX_TOKENS",
+            "QK_DIST_K_STRIDE");
+}
+
+void qk_dist_q_update(int layer, const float * data, int64_t n_head, int64_t head_dim, int64_t n_tokens) {
+    qk_dist_update_state(g_qk_dist_q, layer, data, n_head, head_dim, n_tokens);
+}
+
+void qk_dist_k_update(int layer, const float * data, int64_t n_head, int64_t head_dim, int64_t n_tokens) {
+    qk_dist_update_state(g_qk_dist_k, layer, data, n_head, head_dim, n_tokens);
+}
+
+// CRS scale restoration parameters
+struct crs_restore_params {
+    int32_t layer;
+    int32_t n_head;
+    int32_t n_embd_head;
+};
+
+// CRS scale application: divides K by CRS scale before quantization
+static void crs_apply_op(struct ggml_tensor * dst, const struct ggml_tensor * src, int ith, int nth, void * userdata) {
+    GGML_UNUSED(ith);
+    GGML_UNUSED(nth);
+    
+    const crs_restore_params * params = (const crs_restore_params *)userdata;
+    if (!params || !g_crs_static.enabled) {
+        memcpy(dst->data, src->data, ggml_nbytes(src));
+        return;
+    }
+    
+    const int layer = params->layer;
+    const int n_head = params->n_head;
+    const int n_embd_head = params->n_embd_head;
+    
+    // K shape before cpy: [n_embd_head, n_head, n_tokens]
+    const int64_t ne0 = src->ne[0];  // n_embd_head
+    const int64_t ne1 = src->ne[1];  // n_head
+    const int64_t ne2 = src->ne[2];  // n_tokens
+    
+    const float * src_data = (const float *)src->data;
+    float * dst_data = (float *)dst->data;
+    
+    // Debug: print once per layer for head 1 (head 0 has no outliers)
+    static int debug_count = 0;
+    if (debug_count < 1 && layer == 0) {
+        fprintf(stderr, "[CRS_APPLY] Layer %d, shape=[%ld,%ld,%ld], head 1 outliers: ", layer, (long)ne0, (long)ne1, (long)ne2);
+        for (int d = 80; d < 90; d++) {
+            float s = crs_get_static_scale(layer, 1, d);
+            if (s != 1.0f) fprintf(stderr, "d%d=%.2f ", d, s);
+        }
+        // Debug: Analyze Block 2 (dims 64-95) to find unhandled outliers
+        if (ne2 > 0 && ne1 > 1) {
+            fprintf(stderr, "[DEBUG] Layer %d Head 1 Block 2 (dims 64-95) analysis:\n", layer);
+            float max_val = 0;
+            int max_idx = -1;
+            
+            for (int d = 64; d < 96; d++) {
+                int64_t idx = 0 * ne1 * ne0 + 1 * ne0 + d; // token 0, head 1, dim d
+                float val = fabsf(src_data[idx]);
+                float scale = crs_get_static_scale(layer, 1, d);
+                
+                if (val > max_val) {
+                    max_val = val;
+                    max_idx = d;
+                }
+                
+                // Print any large values (>1.0) and their scale status
+                if (val > 1.0f) {
+                    fprintf(stderr, "  d%d: val=%.4f, scale=%.2f\n", d, val, scale);
+                }
+            }
+            fprintf(stderr, "  => Block Max: d%d = %.4f (Scale applied: %s)\n", 
+                    max_idx, max_val, crs_get_static_scale(layer, 1, max_idx) > 1.0f ? "YES" : "NO");
+        }
+        fprintf(stderr, "\n");
+        debug_count++;
+    }
+    
+    // Apply CRS scale per head, per channel (divide to suppress outliers)
+    for (int64_t t = 0; t < ne2; t++) {
+        for (int64_t h = 0; h < ne1; h++) {
+            for (int64_t d = 0; d < ne0; d++) {
+                int64_t idx = t * ne1 * ne0 + h * ne0 + d;
+                float scale = crs_get_static_scale(layer, h, d);
+                dst_data[idx] = src_data[idx] / scale;  // Divide to suppress
+            }
+        }
+    }
+}
+
+// CRS scale restoration: multiplies K by CRS scale after dequantization
+static void crs_restore_op(struct ggml_tensor * dst, const struct ggml_tensor * src, int ith, int nth, void * userdata) {
+    GGML_UNUSED(ith);
+    GGML_UNUSED(nth);
+    
+    const crs_restore_params * params = (const crs_restore_params *)userdata;
+    if (!params || !g_crs_static.enabled) {
+        memcpy(dst->data, src->data, ggml_nbytes(src));
+        return;
+    }
+    
+    const int layer = params->layer;
+    const int n_head = params->n_head;
+    const int n_embd_head = params->n_embd_head;
+    
+    // BEFORE permute: K shape is [n_embd_head, n_head, n_kv, n_stream]
+    // ne[0] = n_embd_head, ne[1] = n_head, ne[2] = n_kv, ne[3] = n_stream
+    const int64_t ne0 = src->ne[0];  // n_embd_head
+    const int64_t ne1 = src->ne[1];  // n_head
+    const int64_t ne2 = src->ne[2];  // n_kv
+    const int64_t ne3 = src->ne[3];  // n_stream
+    
+    const float * src_data = (const float *)src->data;
+    float * dst_data = (float *)dst->data;
+    
+    // Debug: print once per layer for head 1
+    static int debug_count = 0;
+    if (debug_count < 1 && layer == 0) {
+        fprintf(stderr, "[CRS_RESTORE] Layer %d, shape=[%ld,%ld,%ld,%ld], head 1 outliers: ", layer, (long)ne0, (long)ne1, (long)ne2, (long)ne3);
+        for (int d = 80; d < 90; d++) {
+            float s = crs_get_static_scale(layer, 1, d);
+            if (s != 1.0f) fprintf(stderr, "d%d=%.2f ", d, s);
+        }
+        // Print sample K value before/after restore
+        if (ne2 > 0 && ne1 > 1 && ne3 > 0) {
+            int64_t idx_d80 = 0 * ne2 * ne1 * ne0 + 0 * ne1 * ne0 + 1 * ne0 + 80; // stream 0, kv 0, head 1, dim 80
+            float k_before = src_data[idx_d80];
+            float scale_d80 = crs_get_static_scale(layer, 1, 80);
+            fprintf(stderr, "| K[0,0,1,80]: %.4f * %.2f = %.4f", k_before, scale_d80, k_before*scale_d80);
+        }
+        fprintf(stderr, "\n");
+        debug_count++;
+    }
+    
+    // Restore CRS scale per head, per channel
+    for (int64_t s = 0; s < ne3; s++) {
+        for (int64_t kv = 0; kv < ne2; kv++) {
+            for (int64_t h = 0; h < ne1; h++) {
+                for (int64_t d = 0; d < ne0; d++) {
+                    int64_t idx = s * ne2 * ne1 * ne0 + kv * ne1 * ne0 + h * ne0 + d;
+                    float scale = crs_get_static_scale(layer, h, d);
+                    dst_data[idx] = src_data[idx] * scale;
+                }
+            }
+        }
+    }
+}
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
@@ -361,6 +971,13 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
         if (debug) {
             print_mask(data, n_tokens, n_kv, hparams.n_swa, hparams.swa_type);
         }
+    }
+}
+
+void llm_graph_input_k_cache_pos::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    if (pos && kv_cache) {
+        kv_cache->set_input_k_cache_pos(pos, n_kv, n_pos_per_embd);
     }
 }
 
@@ -1228,6 +1845,19 @@ ggml_tensor * llm_graph_context::build_inp_pos() const {
     return cur;
 }
 
+ggml_tensor * llm_graph_context::build_inp_k_cache_pos(const llama_kv_cache * kv_cache, uint32_t n_kv, uint32_t n_stream) const {
+    auto inp = std::make_unique<llm_graph_input_k_cache_pos>(hparams, cparams, kv_cache, n_kv, hparams.n_pos_per_embd());
+
+    auto & cur = inp->pos;
+
+    cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t)n_kv * n_stream * hparams.n_pos_per_embd());
+    ggml_set_input(cur);
+
+    res->add_input(std::move(inp));
+
+    return cur;
+}
+
 ggml_tensor * llm_graph_context::build_inp_attn_scale() const {
     auto inp = std::make_unique<llm_graph_input_attn_temp>(hparams.n_attn_temp_floor_scale, hparams.f_attn_temp_scale);
 
@@ -1374,6 +2004,18 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     const auto n_stream = k->ne[3];
 
     q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream, q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
+
+    // Apply CRS scale restoration if enabled BEFORE permute
+    // K shape before permute: [n_embd_head, n_head, n_kv, n_stream]
+    if (g_crs_static.enabled && ggml_is_quantized(k->type)) {
+        // First dequantize K to F32
+        k = ggml_cast(ctx0, k, GGML_TYPE_F32);
+        
+        // Apply CRS scale restoration on original layout
+        crs_restore_params * params = new crs_restore_params{il, (int32_t)hparams.n_head_kv(), (int32_t)hparams.n_embd_head_k};
+        k = ggml_map_custom1(ctx0, k, crs_restore_op, GGML_N_TASKS_MAX, params);
+        ggml_format_name(k, "k_crs_restored_l%d", il);
+    }
 
     q = ggml_permute(ctx0, q, 0, 2, 1, 3);
     k = ggml_permute(ctx0, k, 0, 2, 1, 3);
@@ -1588,6 +2230,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         ggml_set_input(inp->self_kq_mask);
 
         inp->self_kq_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->self_kq_mask, GGML_TYPE_F16) : inp->self_kq_mask;
+
     }
 
     return inp;
@@ -1612,7 +2255,8 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * sinks,
         ggml_tensor * v_mla,
             float     kq_scale,
-            int       il) const {
+            int       il,
+        ggml_tensor * rope_factors) const {
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
     // expand k later to enable rope fusion which directly writes into k-v cache
@@ -1627,7 +2271,26 @@ ggml_tensor * llm_graph_context::build_attn(
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        // Apply CRS scale before storing to cache (suppress outliers)
+        ggml_tensor * k_to_store = k_cur;
+        if (g_crs_static.enabled) {
+            crs_restore_params * params = new crs_restore_params{il, (int32_t)hparams.n_head_kv(), (int32_t)hparams.n_embd_head_k};
+            k_to_store = ggml_map_custom1(ctx0, k_cur, crs_apply_op, GGML_N_TASKS_MAX, params);
+            ggml_format_name(k_to_store, "k_crs_applied_l%d", il);
+        }
+
+        // Dump activations if DUMP_PREFIX is set
+        if (std::getenv("DUMP_PREFIX")) {
+            static bool logged = false;
+            if (!logged) {
+                fprintf(stderr, "[DUMP_GRAPH] Adding dump node for Layer %d\n", il);
+                logged = true;
+            }
+            k_to_store = ggml_map_custom1(ctx0, k_to_store, dump_k_callback, 1, (void*)(intptr_t)il);
+            ggml_format_name(k_to_store, "k_dump_l%d", il);
+        }
+
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_to_store, k_idxs, il));
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
@@ -1636,6 +2299,57 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+    // pre_rope: apply RoPE to K from cache at attention time
+    if (cparams.pre_rope) {
+        const auto n_kv = mctx_cur->get_n_kv();
+        const llama_kv_cache * kv_cache = mctx_cur->get_kv_cache();
+
+        // If K is quantized, dequantize to F32 first
+        if (k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_F32) {
+            k = ggml_cast(ctx0, k, GGML_TYPE_F32);
+            cb(k, "k_dequant", il);
+        }
+
+        // If V is quantized, dequantize to F32 to match K type for flash attention
+        if (v->type != GGML_TYPE_F16 && v->type != GGML_TYPE_F32) {
+            v = ggml_cast(ctx0, v, GGML_TYPE_F32);
+            cb(v, "v_dequant", il);
+        }
+
+        const int64_t ne0 = k->ne[0]; // n_embd_head
+        const int64_t ne1 = k->ne[1]; // n_head_kv
+        const int64_t ne2 = k->ne[2]; // n_kv
+        const int64_t ne3 = k->ne[3]; // n_stream (from slot_info, may be < kv_cache->get_n_stream())
+
+        if (ne3 == 1) {
+            // Single stream: apply RoPE directly to 4D K (ne[2]=n_kv matches pos size)
+            ggml_tensor * inp_k_pos = build_inp_k_cache_pos(kv_cache, n_kv, 1);
+            k = ggml_rope_ext(
+                    ctx0, k, inp_k_pos, rope_factors,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow
+                    );
+            cb(k, "k_rope", il);
+            ggml_build_forward_expand(gf, k);
+        } else {
+            // Multi-stream: reshape to 3D so each stream gets its own positions
+            // K may not be contiguous (stride gap when n_kv < kv_size)
+            k = ggml_cont(ctx0, k);
+            k = ggml_reshape_3d(ctx0, k, ne0, ne1, ne2*ne3);
+
+            ggml_tensor * inp_k_pos = build_inp_k_cache_pos(kv_cache, n_kv, ne3);
+            k = ggml_rope_ext(
+                    ctx0, k, inp_k_pos, rope_factors,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow
+                    );
+
+            k = ggml_reshape_4d(ctx0, k, ne0, ne1, ne2, ne3);
+            cb(k, "k_rope", il);
+            ggml_build_forward_expand(gf, k);
+        }
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
@@ -2035,11 +2749,10 @@ void llm_graph_context::build_pooling(
         default:
             {
                 GGML_ABORT("unknown pooling type");
-            }
+            } break;
     }
 
     cb(cur, "result_embd_pooled", -1);
-    res->t_embd_pooled = cur;
 
     ggml_build_forward_expand(gf, cur);
 }

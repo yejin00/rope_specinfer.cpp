@@ -453,6 +453,22 @@ struct llama_model {
 
     std::vector<llama_layer> layers;
 
+    // CRS (Channel-wise Row Scaling) for late dimensions (post-RoPE outliers)
+    // Sparse per-head index/scale tensors consumed by GGML_OP_CRS_SPARSE_MUL.
+    std::vector<struct ggml_tensor *> crs_late_q_indices;
+    std::vector<struct ggml_tensor *> crs_late_q_scales;
+    std::vector<struct ggml_tensor *> crs_late_k_indices;
+    std::vector<struct ggml_tensor *> crs_late_k_scales;
+    
+    struct ggml_context * ctx_crs_late = nullptr;
+    ggml_backend_buffer_t buf_crs_late = nullptr;
+    
+    // Raw sparse CRS data staged before upload into backend tensors.
+    std::vector<std::vector<int32_t>> crs_late_q_indices_data;
+    std::vector<std::vector<float>>   crs_late_q_scales_data;
+    std::vector<std::vector<int32_t>> crs_late_k_indices_data;
+    std::vector<std::vector<float>>   crs_late_k_scales_data;
+
     //Dense linear projections for SentenceTransformers models like embeddinggemma
     // For Sentence Transformers models structure see
     // https://sbert.net/docs/sentence_transformer/usage/custom_models.html#structure-of-sentence-transformer-models
@@ -481,6 +497,7 @@ struct llama_model {
     void load_hparams(llama_model_loader & ml);
     void load_vocab  (llama_model_loader & ml);
     bool load_tensors(llama_model_loader & ml); // returns false if cancelled by progress_callback
+    void load_crs_late_scales(const std::string & scales_path); // Load late CRS sparse index/scale tensors
 
     std::string arch_name() const;
     std::string type_name() const;

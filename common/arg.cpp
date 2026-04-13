@@ -280,6 +280,10 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_BF16,
     GGML_TYPE_Q8_0,
     GGML_TYPE_Q4_0,
+    GGML_TYPE_Q4_0_HEAD,
+    GGML_TYPE_Q2_0,
+    GGML_TYPE_Q4_0_Q2_0_HEAD,
+    GGML_TYPE_Q2_0_Q4_0_HEAD,
     GGML_TYPE_Q4_1,
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
@@ -1012,6 +1016,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                            }
                        }).set_env("LLAMA_ARG_FLASH_ATTN"));
     add_opt(common_arg(
+        {"--pre-rope"},
+        "store K in KV cache before RoPE and apply RoPE at attention time (experimental)",
+        [](common_params & params) {
+            params.pre_rope = true;
+        }
+    ).set_env("LLAMA_ARG_PRE_ROPE"));
+    add_opt(common_arg(
         {"-p", "--prompt"}, "PROMPT",
         "prompt to start generation with; for system message, use -sys",
         [](common_params & params, const std::string & value) {
@@ -1662,6 +1673,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
+        {"--crs-scales-k"}, "FILE",
+        "CRS (Channel-wise Row Scaling) scales file for K cache\n"
+        "Contains static outlier scales for offline CRS",
+        [](common_params & params, const std::string & value) {
+            params.crs_scales_k = value;
+        }
+    ).set_env("LLAMA_ARG_CRS_SCALES_K"));
+    add_opt(common_arg(
+        {"--crs-online-top-k"}, "N",
+        "Enable online CRS with top-K outlier channels per head (default: 0 = disabled)",
+        [](common_params & params, int value) {
+            params.crs_online_top_k = value;
+        }
+    ).set_env("LLAMA_ARG_CRS_ONLINE_TOP_K"));
+    add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
         [](common_params & params) {
@@ -1729,6 +1755,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("output type for perplexity calculation (default: %d)", params.ppl_output_type),
         [](common_params & params, int value) {
             params.ppl_output_type = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}));
+    add_opt(common_arg(
+        {"--ppl-full-chunk"},
+        "evaluate perplexity over the full context chunk instead of only the last half-window",
+        [](common_params & params) {
+            params.ppl_full_chunk = true;
         }
     ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(

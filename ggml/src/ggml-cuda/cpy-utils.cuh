@@ -14,6 +14,39 @@ static __device__ __forceinline__ int best_index_int8(int n, const int8_t * val,
     return x - val[mu-1] < val[mu] - x ? mu-1 : mu;
 }
 
+
+static __device__ void quantize_f32_q2_0_block(const float * __restrict__ x, block_q2_0 * __restrict__ y) {
+    float amax = 0.0f;
+    float vmax = 0.0f;
+
+    for (int j = 0; j < QK2_0; ++j) {
+        const float v = x[j];
+        if (amax < fabsf(v)) {
+            amax = fabsf(v);
+            vmax = v;
+        }
+    }
+
+    const float d  = vmax / -2;
+    const float id = d ? 1.0f/d : 0.0f;
+
+    y->d = d;
+
+    for (int j = 0; j < QK2_0/4; ++j) {
+        const float x0 = x[0        + j]*id;
+        const float x1 = x[QK2_0/2  + j]*id;
+        const float x2 = x[QK2_0/4  + j]*id;
+        const float x3 = x[3*QK2_0/4 + j]*id;
+
+        const uint8_t xi0 = min(3, (int8_t)(x0 + 2.5f));
+        const uint8_t xi1 = min(3, (int8_t)(x1 + 2.5f));
+        const uint8_t xi2 = min(3, (int8_t)(x2 + 2.5f));
+        const uint8_t xi3 = min(3, (int8_t)(x3 + 2.5f));
+
+        y->qs[j] = xi0 | (xi1 << 2) | (xi2 << 4) | (xi3 << 6);
+    }
+}
+
 static __device__ void quantize_f32_q4_0_block(const float * __restrict__ x, block_q4_0 * __restrict__ y) {
     float amax = 0.0f;
     float vmax = 0.0f;
@@ -41,6 +74,49 @@ static __device__ void quantize_f32_q4_0_block(const float * __restrict__ x, blo
         y->qs[j]  = xi0;
         y->qs[j] |= xi1 << 4;
     }
+}
+
+static __device__ void quantize_f32_q4_0_head_block(const float * __restrict__ x, block_q4_0_head * __restrict__ y) {
+    float amax = 0.0f;
+    float vmax = 0.0f;
+
+    for (int j = 0; j < QK4_0_HEAD; ++j) {
+        const float v = x[j];
+        if (amax < fabsf(v)) {
+            amax = fabsf(v);
+            vmax = v;
+        }
+    }
+
+    const float d  = vmax / -8;
+    const float id = d ? 1.0f/d : 0.0f;
+
+    y->d = d;
+
+    for (int j = 0; j < QK4_0_HEAD/2; ++j) {
+        const float x0 = x[0            + j]*id;
+        const float x1 = x[QK4_0_HEAD/2 + j]*id;
+
+        const uint8_t xi0 = min(15, (int8_t)(x0 + 8.5f));
+        const uint8_t xi1 = min(15, (int8_t)(x1 + 8.5f));
+
+        y->qs[j]  = xi0;
+        y->qs[j] |= xi1 << 4;
+    }
+}
+
+static __device__ void quantize_f32_q4_0_q2_0_head_block(const float * __restrict__ x, block_q4_0_q2_0_head * __restrict__ y) {
+    quantize_f32_q4_0_block(x +  0, &y->q4[0]);
+    quantize_f32_q4_0_block(x + 32, &y->q4[1]);
+    quantize_f32_q2_0_block(x + 64, &y->q2[0]);
+    quantize_f32_q2_0_block(x + 96, &y->q2[1]);
+}
+
+static __device__ void quantize_f32_q2_0_q4_0_head_block(const float * __restrict__ x, block_q2_0_q4_0_head * __restrict__ y) {
+    quantize_f32_q2_0_block(x +  0, &y->q2[0]);
+    quantize_f32_q2_0_block(x + 32, &y->q2[1]);
+    quantize_f32_q4_0_block(x + 64, &y->q4[0]);
+    quantize_f32_q4_0_block(x + 96, &y->q4[1]);
 }
 
 static __device__ void quantize_f32_q4_1_block(const float * __restrict__ x, block_q4_1 * __restrict__ y) {
@@ -187,8 +263,20 @@ static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, b
 }
 
 // Wrapper functions for cpy.cu compatibility
+static __device__ void cpy_blck_f32_q2_0(const char * cxi, char * cdsti) {
+    quantize_f32_q2_0_block((const float *)cxi, (block_q2_0 *)cdsti);
+}
+
 static __device__ void cpy_blck_f32_q4_0(const char * cxi, char * cdsti) {
     quantize_f32_q4_0_block((const float *)cxi, (block_q4_0 *)cdsti);
+}
+
+static __device__ void cpy_blck_f32_q4_0_q2_0_head(const char * cxi, char * cdsti) {
+    quantize_f32_q4_0_q2_0_head_block((const float *)cxi, (block_q4_0_q2_0_head *)cdsti);
+}
+
+static __device__ void cpy_blck_f32_q2_0_q4_0_head(const char * cxi, char * cdsti) {
+    quantize_f32_q2_0_q4_0_head_block((const float *)cxi, (block_q2_0_q4_0_head *)cdsti);
 }
 
 static __device__ void cpy_blck_f32_q4_1(const char * cxi, char * cdsti) {

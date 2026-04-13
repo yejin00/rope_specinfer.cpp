@@ -628,6 +628,30 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) ggml_fp16_to_fp32_row,
         .from_float_ref           = (ggml_from_float_t) ggml_fp32_to_fp16_row,
     },
+    [GGML_TYPE_Q2_0] = {
+        .type_name                = "q2_0",
+        .blck_size                = QK2_0,
+        .type_size                = sizeof(block_q2_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q2_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q2_0_ref,
+    },
+    [GGML_TYPE_Q4_0_Q2_0_HEAD] = {
+        .type_name                = "q4_0_q2_0_head",
+        .blck_size                = QK4_0_Q2_0_HEAD,
+        .type_size                = sizeof(block_q4_0_q2_0_head),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q4_0_q2_0_head,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q4_0_q2_0_head_ref,
+    },
+    [GGML_TYPE_Q2_0_Q4_0_HEAD] = {
+        .type_name                = "q2_0_q4_0_head",
+        .blck_size                = QK4_0_Q2_0_HEAD,
+        .type_size                = sizeof(block_q2_0_q4_0_head),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q2_0_q4_0_head,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q2_0_q4_0_head_ref,
+    },
     [GGML_TYPE_Q4_0] = {
         .type_name                = "q4_0",
         .blck_size                = QK4_0,
@@ -873,6 +897,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 0,
         .is_quantized             = false,
     },
+    [GGML_TYPE_Q4_0_HEAD] = {
+        .type_name                = "q4_0_head",
+        .blck_size                = QK4_0_HEAD,
+        .type_size                = sizeof(block_q4_0_head),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q4_0_head,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q4_0_head_ref,
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
@@ -964,6 +996,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GET_ROWS",
     "GET_ROWS_BACK",
     "SET_ROWS",
+    "CRS_SPARSE_MUL",
     "DIAG",
     "DIAG_MASK_INF",
     "DIAG_MASK_ZERO",
@@ -1023,7 +1056,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 94, "GGML_OP_COUNT != 94");
+static_assert(GGML_OP_COUNT == 95, "GGML_OP_COUNT != 95");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1072,6 +1105,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "get_rows(x)",
     "get_rows_back(x)",
     "set_rows(x)",
+    "crs_sparse_mul(x)",
     "diag(x)",
     "diag_mask_inf(x)",
     "diag_mask_zero(x)",
@@ -1131,7 +1165,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 94, "GGML_OP_COUNT != 94");
+static_assert(GGML_OP_COUNT == 95, "GGML_OP_COUNT != 95");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3820,6 +3854,39 @@ struct ggml_tensor * ggml_set_rows(
     result->src[0] = b;
     result->src[1] = c;
     result->src[2] = a; // note: order is weird due to legacy reasons (https://github.com/ggml-org/llama.cpp/pull/16063#discussion_r2385795931)
+
+    return result;
+}
+
+// ggml_crs_sparse_mul_inplace
+
+struct ggml_tensor * ggml_crs_sparse_mul_inplace(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * c) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16);
+    GGML_ASSERT(b->type == GGML_TYPE_I32);
+    GGML_ASSERT(c->type == GGML_TYPE_F32);
+
+    GGML_ASSERT(b->ne[0] == c->ne[0]);
+    GGML_ASSERT(b->ne[1] == c->ne[1]);
+    GGML_ASSERT(b->ne[2] == c->ne[2]);
+    GGML_ASSERT(b->ne[3] == c->ne[3]);
+
+    GGML_ASSERT(a->ne[1] == b->ne[1]);
+    GGML_ASSERT(b->ne[2] == 1);
+    GGML_ASSERT(b->ne[3] == 1);
+
+    GGML_ASSERT(ggml_is_contiguous_rows(b));
+    GGML_ASSERT(ggml_is_contiguous_rows(c));
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, a);
+
+    result->op     = GGML_OP_CRS_SPARSE_MUL;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = c;
 
     return result;
 }
@@ -7443,7 +7510,11 @@ size_t ggml_quantize_chunk(
     size_t result = 0;
 
     switch (type) {
+        case GGML_TYPE_Q2_0:    result = quantize_q2_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_0:    result = quantize_q4_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q4_0_HEAD: result = quantize_q4_0_head(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q4_0_Q2_0_HEAD: result = quantize_q4_0_q2_0_head(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q2_0_Q4_0_HEAD: result = quantize_q2_0_q4_0_head(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_1:    result = quantize_q4_1(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q5_0:    result = quantize_q5_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q5_1:    result = quantize_q5_1(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;

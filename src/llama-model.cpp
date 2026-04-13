@@ -462,7 +462,14 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
 }
 
-llama_model::~llama_model() {}
+llama_model::~llama_model() {
+    if (ctx_crs_late) {
+        ggml_free(ctx_crs_late);
+    }
+    if (buf_crs_late) {
+        ggml_backend_buffer_free(buf_crs_late);
+    }
+}
 
 void llama_model::load_stats(llama_model_loader & ml) {
     pimpl->n_elements = ml.n_elements;

@@ -10,9 +10,16 @@
 #include <cfloat>
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
 
 // ggml_compute_forward_dup
+
+static bool ggml_crs_use_index_path() {
+    const char * env = getenv("LLAMA_CRS_INDEX_PATH");
+    return env != nullptr && atoi(env) == 1;
+}
 
 static void ggml_compute_forward_dup_same_cont(
         const ggml_compute_params * params,
@@ -1241,6 +1248,9 @@ void ggml_compute_forward_acc(
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
         case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_0_HEAD:
+        case GGML_TYPE_Q4_0_Q2_0_HEAD:
+        case GGML_TYPE_Q2_0_Q4_0_HEAD:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
@@ -4900,6 +4910,97 @@ void ggml_compute_forward_set_rows(
     }
 }
 
+void ggml_compute_forward_crs_sparse_mul(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * src2 = dst->src[2];
+
+    GGML_ASSERT(src0 != nullptr);
+    GGML_ASSERT(src1 != nullptr);
+    GGML_ASSERT(src2 != nullptr);
+    GGML_ASSERT(src1->type == GGML_TYPE_I32);
+    GGML_ASSERT(src2->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+
+    if (params->ith != 0) {
+        return;
+    }
+
+    const int64_t ne0 = dst->ne[0];
+    const int64_t ne1 = dst->ne[1];
+    const int64_t ne2 = dst->ne[2];
+    const int64_t ne3 = dst->ne[3];
+    const int64_t top_k = src1->ne[0];
+
+    GGML_ASSERT(src1->ne[1] == ne1);
+    GGML_ASSERT(src2->ne[0] == top_k);
+    GGML_ASSERT(src2->ne[1] == ne1);
+
+    if (ggml_crs_use_index_path()) {
+        for (int64_t i3 = 0; i3 < ne3; ++i3) {
+            for (int64_t i2 = 0; i2 < ne2; ++i2) {
+                for (int64_t h = 0; h < ne1; ++h) {
+                    for (int64_t k = 0; k < top_k; ++k) {
+                        const int32_t idx = *(const int32_t *) ((const char *) src1->data + k * src1->nb[0] + h * src1->nb[1]);
+                        if (idx < 0 || idx >= ne0) {
+                            continue;
+                        }
+
+                        const float scale = *(const float *) ((const char *) src2->data + k * src2->nb[0] + h * src2->nb[1]);
+                        char * dst_ptr = (char *) dst->data + idx * dst->nb[0] + h * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3];
+
+                        if (dst->type == GGML_TYPE_F32) {
+                            float * value = (float *) dst_ptr;
+                            *value *= scale;
+                        } else {
+                            ggml_fp16_t * value = (ggml_fp16_t *) dst_ptr;
+                            *value = ggml_fp32_to_fp16(ggml_fp16_to_fp32(*value) * scale);
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        for (int64_t i3 = 0; i3 < ne3; ++i3) {
+            for (int64_t i2 = 0; i2 < ne2; ++i2) {
+                for (int64_t h = 0; h < ne1; ++h) {
+                    for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                        float total_scale = 1.0f;
+
+                        // Dense full multiply path: scan the sparse list for every
+                        // channel so the CRS correction shows up as measurable
+                        // overhead while preserving the sparse scaling semantics.
+                        for (int64_t k = 0; k < top_k; ++k) {
+                            const int32_t idx = *(const int32_t *) ((const char *) src1->data + k * src1->nb[0] + h * src1->nb[1]);
+                            if (idx != i0) {
+                                continue;
+                            }
+
+                            const float scale = *(const float *) ((const char *) src2->data + k * src2->nb[0] + h * src2->nb[1]);
+                            total_scale *= scale;
+                        }
+
+                        const char * src_ptr = (const char *) src0->data + i0 * src0->nb[0] + h * src0->nb[1] + i2 * src0->nb[2] + i3 * src0->nb[3];
+                        char * dst_ptr = (char *) dst->data + i0 * dst->nb[0] + h * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3];
+
+                        if (dst->type == GGML_TYPE_F32) {
+                            const float value = *(const float *) src_ptr;
+                            *(float *) dst_ptr = value * total_scale;
+                        } else {
+                            const ggml_fp16_t value = *(const ggml_fp16_t *) src_ptr;
+                            *(ggml_fp16_t *) dst_ptr = ggml_fp32_to_fp16(ggml_fp16_to_fp32(value) * total_scale);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ggml_compute_forward_get_rows_back
 
 static void ggml_compute_forward_get_rows_back_f32_f16(
@@ -5485,6 +5586,9 @@ void ggml_compute_forward_clamp(
             } break;
         case GGML_TYPE_BF16:
         case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_0_HEAD:
+        case GGML_TYPE_Q4_0_Q2_0_HEAD:
+        case GGML_TYPE_Q2_0_Q4_0_HEAD:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:

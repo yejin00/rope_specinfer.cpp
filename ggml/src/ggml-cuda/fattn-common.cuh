@@ -66,6 +66,54 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f16(
     return sum;
 }
 
+static __device__ __forceinline__ int ggml_cuda_q2_0_get_code(const uint8_t * qs, const int ir) {
+    const uint8_t q = qs[ir & 0x7];
+    switch (ir >> 3) {
+        case 0: return (q >> 0) & 0x03;
+        case 1: return (q >> 4) & 0x03;
+        case 2: return (q >> 2) & 0x03;
+        default: return (q >> 6) & 0x03;
+    }
+}
+
+static __device__ __forceinline__ int ggml_cuda_q4_0_get_code(const uint8_t * qs, const int ir) {
+    const uint8_t q = qs[ir & 0x0F];
+    return ir < 16 ? (q & 0x0F) : (q >> 4);
+}
+
+template<int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q2_0(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_q2_0 * K_q2_0 = (const block_q2_0 *) K_c;
+    GGML_UNUSED(Q_v);
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+
+        const int i0 = 4*k_KQ;
+        const int ib = i0 / QK2_0;
+        const int ir = i0 % QK2_0;
+
+        int v = 0;
+        v |= ggml_cuda_q2_0_get_code(K_q2_0[ib].qs, ir + 0) <<  0;
+        v |= ggml_cuda_q2_0_get_code(K_q2_0[ib].qs, ir + 1) <<  8;
+        v |= ggml_cuda_q2_0_get_code(K_q2_0[ib].qs, ir + 2) << 16;
+        v |= ggml_cuda_q2_0_get_code(K_q2_0[ib].qs, ir + 3) << 24;
+
+        const int u = Q_q8[k_KQ_0/nthreads];
+        const int sumi = ggml_cuda_dp4a(v, u, 0);
+
+        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
+        sum += __half2float(K_q2_0[ib].d) * (sumi*Q_ds.x - (2.0f/QI8_1)*Q_ds.y);
+    }
+
+    return sum;
+}
+
 template<int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q4_0(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
@@ -92,6 +140,141 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q4_0(
 
         const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
         sum += __half2float(K_q4_0[ib].d) * (sumi*Q_ds.x - (8/QI8_1)*Q_ds.y);
+    }
+
+    return sum;
+}
+
+template<int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q4_0_head(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_q4_0_head * K_q4_0_head = (const block_q4_0_head *) K_c;
+    GGML_UNUSED(Q_v);
+
+    float sum = 0.0f;
+
+    // q4_0_head: QK=128, 64 bytes qs per block, 32 int32s per block total
+    // First 16 int32s -> low nibble (elements 0-63), next 16 -> high nibble (elements 64-127)
+    constexpr int k_per_block = QK4_0_HEAD / 4;  // 32 int32s per block
+    constexpr int k_per_half  = QK4_0_HEAD / 8;  // 16 int32s per half-block
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+
+        const int ib    = k_KQ / k_per_block;
+        const int k_loc = k_KQ % k_per_block;
+        const int iqs4  = k_loc % k_per_half;
+        const int shift = (k_loc / k_per_half) * 4;
+
+        int v;
+        ggml_cuda_memcpy_1<sizeof(int), 2>(&v, K_q4_0_head[ib].qs + sizeof(int)*iqs4);
+        v = (v >> shift) & 0x0F0F0F0F;
+        const int u = Q_q8[k_KQ_0/nthreads];
+
+        const int sumi = ggml_cuda_dp4a(v, u, 0);
+
+        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
+        sum += __half2float(K_q4_0_head[ib].d) * (sumi*Q_ds.x - (8/QI8_1)*Q_ds.y);
+    }
+
+    return sum;
+}
+
+template<int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q4_0_q2_0_head(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_q4_0_q2_0_head * K_mix = (const block_q4_0_q2_0_head *) K_c;
+    GGML_UNUSED(Q_v);
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+        const int i0 = 4*k_KQ;
+        const int ib = i0 / QK4_0_Q2_0_HEAD;
+        const int il = i0 % QK4_0_Q2_0_HEAD;
+
+        int v = 0;
+        float d;
+        float bias;
+        if (il < 64) {
+            const int iq4_block = il / QK4_0;
+            const int ir4 = il % QK4_0;
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                v |= ggml_cuda_q4_0_get_code(K_mix[ib].q4[iq4_block].qs, ir4 + l) << (8*l);
+            }
+            d = __half2float(K_mix[ib].q4[iq4_block].d);
+            bias = 8.0f/QI8_1;
+        } else {
+            const int il2 = il - 64;
+            const int iq2_block = il2 / QK2_0;
+            const int ir2 = il2 % QK2_0;
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                v |= ggml_cuda_q2_0_get_code(K_mix[ib].q2[iq2_block].qs, ir2 + l) << (8*l);
+            }
+            d = __half2float(K_mix[ib].q2[iq2_block].d);
+            bias = 2.0f/QI8_1;
+        }
+
+        const int u = Q_q8[k_KQ_0/nthreads];
+        const int sumi = ggml_cuda_dp4a(v, u, 0);
+        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
+        sum += d * (sumi*Q_ds.x - bias*Q_ds.y);
+    }
+
+    return sum;
+}
+
+template<int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q2_0_q4_0_head(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_q2_0_q4_0_head * K_mix = (const block_q2_0_q4_0_head *) K_c;
+    GGML_UNUSED(Q_v);
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+        const int i0 = 4*k_KQ;
+        const int ib = i0 / QK4_0_Q2_0_HEAD;
+        const int il = i0 % QK4_0_Q2_0_HEAD;
+
+        int v = 0;
+        float d;
+        float bias;
+        if (il < 64) {
+            const int iq2_block = il / QK2_0;
+            const int ir2 = il % QK2_0;
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                v |= ggml_cuda_q2_0_get_code(K_mix[ib].q2[iq2_block].qs, ir2 + l) << (8*l);
+            }
+            d = __half2float(K_mix[ib].q2[iq2_block].d);
+            bias = 2.0f/QI8_1;
+        } else {
+            const int il4 = il - 64;
+            const int iq4_block = il4 / QK4_0;
+            const int ir4 = il4 % QK4_0;
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                v |= ggml_cuda_q4_0_get_code(K_mix[ib].q4[iq4_block].qs, ir4 + l) << (8*l);
+            }
+            d = __half2float(K_mix[ib].q4[iq4_block].d);
+            bias = 8.0f/QI8_1;
+        }
+
+        const int u = Q_q8[k_KQ_0/nthreads];
+        const int sumi = ggml_cuda_dp4a(v, u, 0);
+        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
+        sum += d * (sumi*Q_ds.x - bias*Q_ds.y);
     }
 
     return sum;
@@ -314,6 +497,41 @@ static __device__ __forceinline__ void dequantize_V_f16(const void * __restrict_
 }
 
 template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_q2_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_q2_0 * x = (const block_q2_0 *) vx;
+
+    const int64_t ib  = i0 / QK2_0;
+    const int     ir0 = i0 % QK2_0;
+
+    int8_t q8[ne];
+#pragma unroll
+    for (int l = 0; l < ne; ++l) {
+        q8[l] = ggml_cuda_q2_0_get_code(x[ib].qs, ir0 + l) - 2;
+    }
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+        const half2 d = __half2half2(x[ib].d);
+
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            ((half2 *) dst)[l0/2] = d * make_half2(q8[l0 + 0], q8[l0 + 1]);
+        }
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, float>) {
+        const float d = x[ib].d;
+
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            ((float *) dst)[l] = d * q8[l];
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "bad type");
+    }
+}
+
+template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_q4_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_q4_0 * x = (const block_q4_0 *) vx;
 
@@ -345,6 +563,133 @@ static __device__ __forceinline__ void dequantize_V_q4_0(const void * __restrict
 
 #pragma unroll
         for (int l = 0; l < ne; ++l) {
+            ((float *) dst)[l] = d * q8[l];
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "bad type");
+    }
+}
+
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_q4_0_head(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_q4_0_head * x = (const block_q4_0_head *) vx;
+
+    const int64_t ib    =  i0              /  QK4_0_HEAD;
+    const int     iqs   =  i0              % (QK4_0_HEAD/2);
+    const int     shift = (i0 % QK4_0_HEAD) / (QK4_0_HEAD/2);
+
+    int q;
+    static_assert(ne == 2 || ne == 4, "bad ne");
+    ggml_cuda_memcpy_1<ne, 2>(&q, x[ib].qs + iqs);
+    q >>= 4*shift;
+    q &= 0x0F0F0F0F;
+    q = __vsubss4(q, 0x08080808);
+
+    const int8_t * q8 = (const int8_t *) &q;
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+        const half2 d = __half2half2(x[ib].d);
+
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            ((half2 *) dst)[l0/2] = d * make_half2(q8[l0 + 0], q8[l0 + 1]);
+        }
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, float>) {
+        const float d = x[ib].d;
+
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            ((float *) dst)[l] = d * q8[l];
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "bad type");
+    }
+}
+
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_q4_0_q2_0_head(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_q4_0_q2_0_head * x = (const block_q4_0_q2_0_head *) vx;
+
+    int8_t q8[ne];
+#pragma unroll
+    for (int l = 0; l < ne; ++l) {
+        const int idx = i0 + l;
+        if (idx < 64) {
+            const int iq4_block = idx / QK4_0;
+            const int ir4 = idx % QK4_0;
+            q8[l] = ggml_cuda_q4_0_get_code(x[0].q4[iq4_block].qs, ir4) - 8;
+        } else {
+            const int idx2 = idx - 64;
+            const int iq2_block = idx2 / QK2_0;
+            const int ir2 = idx2 % QK2_0;
+            q8[l] = ggml_cuda_q2_0_get_code(x[0].q2[iq2_block].qs, ir2) - 2;
+        }
+    }
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            const int idx0 = i0 + l0 + 0;
+            const int idx1 = i0 + l0 + 1;
+            const float d0 = idx0 < 64 ? __half2float(x[0].q4[idx0 / QK4_0].d) : __half2float(x[0].q2[(idx0 - 64) / QK2_0].d);
+            const float d1 = idx1 < 64 ? __half2float(x[0].q4[idx1 / QK4_0].d) : __half2float(x[0].q2[(idx1 - 64) / QK2_0].d);
+            ((half2 *) dst)[l0/2] = make_half2(d0 * q8[l0 + 0], d1 * q8[l0 + 1]);
+        }
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, float>) {
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            const int idx = i0 + l;
+            const float d = idx < 64 ? __half2float(x[0].q4[idx / QK4_0].d) : __half2float(x[0].q2[(idx - 64) / QK2_0].d);
+            ((float *) dst)[l] = d * q8[l];
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "bad type");
+    }
+}
+
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_q2_0_q4_0_head(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_q2_0_q4_0_head * x = (const block_q2_0_q4_0_head *) vx;
+
+    int8_t q8[ne];
+#pragma unroll
+    for (int l = 0; l < ne; ++l) {
+        const int idx = i0 + l;
+        if (idx < 64) {
+            const int iq2_block = idx / QK2_0;
+            const int ir2 = idx % QK2_0;
+            q8[l] = ggml_cuda_q2_0_get_code(x[0].q2[iq2_block].qs, ir2) - 2;
+        } else {
+            const int idx4 = idx - 64;
+            const int iq4_block = idx4 / QK4_0;
+            const int ir4 = idx4 % QK4_0;
+            q8[l] = ggml_cuda_q4_0_get_code(x[0].q4[iq4_block].qs, ir4) - 8;
+        }
+    }
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            const int idx0 = i0 + l0 + 0;
+            const int idx1 = i0 + l0 + 1;
+            const float d0 = idx0 < 64 ? __half2float(x[0].q2[idx0 / QK2_0].d) : __half2float(x[0].q4[(idx0 - 64) / QK4_0].d);
+            const float d1 = idx1 < 64 ? __half2float(x[0].q2[idx1 / QK2_0].d) : __half2float(x[0].q4[(idx1 - 64) / QK4_0].d);
+            ((half2 *) dst)[l0/2] = make_half2(d0 * q8[l0 + 0], d1 * q8[l0 + 1]);
+        }
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, float>) {
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            const int idx = i0 + l;
+            const float d = idx < 64 ? __half2float(x[0].q2[idx / QK2_0].d) : __half2float(x[0].q4[(idx - 64) / QK4_0].d);
             ((float *) dst)[l] = d * q8[l];
         }
     } else {
@@ -529,6 +874,8 @@ template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
         return vec_dot_fattn_vec_KQ_f16<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_Q2_0) {
+        return vec_dot_fattn_vec_KQ_q2_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q4_0) {
         return vec_dot_fattn_vec_KQ_q4_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q4_1) {
@@ -539,6 +886,12 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q5_1<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q8_0) {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_Q4_0_HEAD) {
+        return vec_dot_fattn_vec_KQ_q4_0_head<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_Q4_0_Q2_0_HEAD) {
+        return vec_dot_fattn_vec_KQ_q4_0_q2_0_head<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_Q2_0_Q4_0_HEAD) {
+        return vec_dot_fattn_vec_KQ_q2_0_q4_0_head<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -549,6 +902,8 @@ template <ggml_type type_V, typename T, int ne>
 constexpr __device__ dequantize_V_t get_dequantize_V() {
     if constexpr (type_V == GGML_TYPE_F16) {
         return dequantize_V_f16<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_Q2_0) {
+        return dequantize_V_q2_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_Q4_0) {
         return dequantize_V_q4_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_Q4_1) {
@@ -559,6 +914,12 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q5_1<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_Q8_0) {
         return dequantize_V_q8_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_Q4_0_HEAD) {
+        return dequantize_V_q4_0_head<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_Q4_0_Q2_0_HEAD) {
+        return dequantize_V_q4_0_q2_0_head<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_Q2_0_Q4_0_HEAD) {
+        return dequantize_V_q2_0_q4_0_head<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;

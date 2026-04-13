@@ -138,6 +138,11 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 
 #ifdef GGML_CUDA_FA_ALL_QUANTS
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q2_0, GGML_TYPE_Q2_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_Q4_0_HEAD, GGML_TYPE_Q4_0_HEAD)
+    FATTN_VEC_CASE(128, GGML_TYPE_Q4_0_Q2_0_HEAD, GGML_TYPE_Q4_0_Q2_0_HEAD)
+    FATTN_VEC_CASE(128, GGML_TYPE_Q2_0_Q4_0_HEAD, GGML_TYPE_Q2_0_Q4_0_HEAD)
+    FATTN_VEC_CASE(128, GGML_TYPE_Q2_0_Q4_0_HEAD, GGML_TYPE_Q4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_1, GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_0, GGML_TYPE_F16)
@@ -180,6 +185,11 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
 #else
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q2_0, GGML_TYPE_Q2_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_Q4_0_HEAD, GGML_TYPE_Q4_0_HEAD)
+    FATTN_VEC_CASE(128, GGML_TYPE_Q4_0_Q2_0_HEAD, GGML_TYPE_Q4_0_Q2_0_HEAD)
+    FATTN_VEC_CASE(128, GGML_TYPE_Q2_0_Q4_0_HEAD, GGML_TYPE_Q2_0_Q4_0_HEAD)
+    FATTN_VEC_CASE(128, GGML_TYPE_Q2_0_Q4_0_HEAD, GGML_TYPE_Q4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
 #endif // GGML_CUDA_FA_ALL_QUANTS
@@ -195,6 +205,15 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_WMMA_F16 = 300,
     BEST_FATTN_KERNEL_MMA_F16  = 400,
 };
+
+static bool ggml_cuda_fattn_supports_kv_type_pair(const ggml_type type_k, const ggml_type type_v) {
+    if (type_k == type_v) {
+        return true;
+    }
+
+    // Allow mixed custom-K / q4_0-V KV cache in CUDA flash attention.
+    return type_k == GGML_TYPE_Q2_0_Q4_0_HEAD && type_v == GGML_TYPE_Q4_0;
+}
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
@@ -246,7 +265,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
 #ifndef GGML_CUDA_FA_ALL_QUANTS
-    if (K->type != V->type) {
+    if (!ggml_cuda_fattn_supports_kv_type_pair(K->type, V->type)) {
         return BEST_FATTN_KERNEL_NONE;
     }
 #endif // GGML_CUDA_FA_ALL_QUANTS
@@ -261,7 +280,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 #ifndef GGML_CUDA_FA_ALL_QUANTS
             return BEST_FATTN_KERNEL_NONE;
 #endif // GGML_CUDA_FA_ALL_QUANTS
+        case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_0_HEAD:
+        case GGML_TYPE_Q4_0_Q2_0_HEAD:
+        case GGML_TYPE_Q2_0_Q4_0_HEAD:
         case GGML_TYPE_Q8_0:
             break;
         default:

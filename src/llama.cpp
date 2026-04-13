@@ -144,6 +144,12 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
         if (!model.load_tensors(ml)) {
             return -2;
         }
+
+        // Load late CRS scales if environment variable is set
+        const char * crs_late_path = getenv("LLAMA_CRS_LATE_SCALES");
+        if (crs_late_path) {
+            model.load_crs_late_scales(crs_late_path);
+        }
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());
         return -1;

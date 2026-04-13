@@ -17,164 +17,123 @@
 REQD_SUBGROUP_SIZE_128
 #endif
 
-#define WGS 128
-
 kernel void kernel_mul_mat_Ab_Bi_8x4(
-    global const ushort *src0_q,          // Q4_0 weights   [M x K/2], 4bit packed (nibbles)
-    global const half   *src0_d,          // scales         [M x (K/32)]
-    __read_only  image1d_buffer_t src1,     // B: N x K row-major, pixel = half4 (K/4 픽셀)
-    global float *dst,                    // C: N x M, row-major
-    int ne01,                               // M
-    int ne02,                               // N_padded (unused)
-    int ne00,                               // K
-    int ne1)                                // N
-{
-    const int WI_M = get_local_size(1);
-    const int WI_K = get_local_size(2);
-    const int gid_n = get_global_id(0);
-    const int gid_m = get_group_id(1);
-    const int lid_m = get_local_id(1);
-    const int lid_k = get_local_id(2);
-    const int lsz_m = get_local_size(1);
-    const int lsz_k = get_local_size(2);
+        global const ushort * src0_q,       // quantized A
+        global const half  * src0_d,        // A scales
+        __read_only image1d_buffer_t src1,  // B (1d image)
+        global float * dst,                 // C
+        int m,                              // M
+        int n,                              // N with padding
+        int k,                              // K
+        int n_no_padding                    // N without padding
+) {
 
-    const int M   = ne01;
-    const int K   = ne00;
-    const int N   = ne1;
-    const int K_4 = K >> 2;
+    int m_4 = m >> 2;
+    int n_4 = n >> 2;
 
-    const int out_b_idx = gid_n << 3;
-    const int oc4 = (gid_m * lsz_m + lid_m) << 2;
-    const int out_off = oc4 + out_b_idx * M;
+    int gy = get_global_id(0);
+    int gx = get_global_id(1);
+    int gx_2 = gx << 2;
 
-    global const ushort *wptr = src0_q + oc4;
-    global const half   *sptr = src0_d + oc4;
+    half8 c0 = 0, c1 = 0, c2 = 0, c3 = 0; // 8x4 output elements
+    half8 B; // registers for activations
+    half4 dequantized_weights; // registers for dequantized weights
+    __global const ushort* weight_ptr = src0_q + gx_2; // pointer for weights
+    __global const half* scale_ptr = src0_d + gx_2; // pointer for scales
 
-    const int b_row0_pix = out_b_idx * K_4;
+    for(int i=0; i<k; i+=4){ //loop through K dimension
 
-    half4 acc0 = (half4)0, acc1 = (half4)0, acc2 = (half4)0, acc3 = (half4)0;
-    half4 acc4 = (half4)0, acc5 = (half4)0, acc6 = (half4)0, acc7 = (half4)0;
+        B.s0123 = read_imageh(src1, gy*2 + (i)*(n_4));
+        B.s4567 = read_imageh(src1, gy*2 + (i)*(n_4)+1);
 
-    for (int k4 = lid_k; k4 < K_4; k4 += lsz_k) {
-        // scale: (k4*4)/32 == k4/8
-        const half4 sc = vload4(0, sptr + (k4 >> 3) * M);
+        // keep (i/4) and (i/32) in parenthesis, rounds down
+        // load 4 consecutive groups of 4 weights
+        ushort4 bits4 = vload4(0, weight_ptr + (i/4)*(m)); // (i/4) because weights grouped in 4s
 
-        const int p = b_row0_pix + k4;
-        const half4 in0 = read_imageh(src1, p + 0*K_4);
-        const half4 in1 = read_imageh(src1, p + 1*K_4);
-        const half4 in2 = read_imageh(src1, p + 2*K_4);
-        const half4 in3 = read_imageh(src1, p + 3*K_4);
-        const half4 in4 = read_imageh(src1, p + 4*K_4);
-        const half4 in5 = read_imageh(src1, p + 5*K_4);
-        const half4 in6 = read_imageh(src1, p + 6*K_4);
-        const half4 in7 = read_imageh(src1, p + 7*K_4);
+        // load 4 consecutive scales
+        half4 scale = vload4(0, scale_ptr + (i/32)*(m));// (i/32) because 1 scale per 32 elements
 
-        const ushort4 bits4 = vload4(0, wptr + k4 * M);
-        half4 w;
+        // j=0
+        dequantized_weights.s0 = ((bits4.s0 & (0x000F)) - 8) * scale.s0; // dequantize a row of the 16 weights
+        dequantized_weights.s1 = ((bits4.s1 & (0x000F)) - 8) * scale.s1;
+        dequantized_weights.s2 = ((bits4.s2 & (0x000F)) - 8) * scale.s2;
+        dequantized_weights.s3 = ((bits4.s3 & (0x000F)) - 8) * scale.s3;
+        c0 += B * dequantized_weights.s0; // vector-scalar multiplication to accumulate
+        c1 += B * dequantized_weights.s1;
+        c2 += B * dequantized_weights.s2;
+        c3 += B * dequantized_weights.s3;
 
-        // nibble j=0
-        w.s0 = ((bits4.s0 & 0x000F) - 8) * sc.s0;
-        w.s1 = ((bits4.s1 & 0x000F) - 8) * sc.s1;
-        w.s2 = ((bits4.s2 & 0x000F) - 8) * sc.s2;
-        w.s3 = ((bits4.s3 & 0x000F) - 8) * sc.s3;
-        acc0 += (half4)(in0.s0) * w;  // 각 행: 열4개 동시에
-        acc1 += (half4)(in1.s0) * w;
-        acc2 += (half4)(in2.s0) * w;
-        acc3 += (half4)(in3.s0) * w;
-        acc4 += (half4)(in4.s0) * w;
-        acc5 += (half4)(in5.s0) * w;
-        acc6 += (half4)(in6.s0) * w;
-        acc7 += (half4)(in7.s0) * w;
+        // j=1
+        B.s0123 = read_imageh(src1, gy*2 + (i+1)*(n_4));
+        B.s4567 = read_imageh(src1, gy*2 + (i+1)*(n_4)+1);
+        dequantized_weights.s0 = (((bits4.s0 & (0x00F0)) >> 4) - 8) * scale.s0; // dequantize a row of the 16 weights
+        dequantized_weights.s1 = (((bits4.s1 & (0x00F0)) >> 4) - 8) * scale.s1;
+        dequantized_weights.s2 = (((bits4.s2 & (0x00F0)) >> 4) - 8) * scale.s2;
+        dequantized_weights.s3 = (((bits4.s3 & (0x00F0)) >> 4) - 8) * scale.s3;
+        c0 += B * dequantized_weights.s0; //vector-scalar multiplication to accumulate
+        c1 += B * dequantized_weights.s1;
+        c2 += B * dequantized_weights.s2;
+        c3 += B * dequantized_weights.s3;
 
-        // nibble j=1
-        w.s0 = (((bits4.s0 & 0x00F0) >> 4) - 8) * sc.s0;
-        w.s1 = (((bits4.s1 & 0x00F0) >> 4) - 8) * sc.s1;
-        w.s2 = (((bits4.s2 & 0x00F0) >> 4) - 8) * sc.s2;
-        w.s3 = (((bits4.s3 & 0x00F0) >> 4) - 8) * sc.s3;
-        acc0 += (half4)(in0.s1) * w;
-        acc1 += (half4)(in1.s1) * w;
-        acc2 += (half4)(in2.s1) * w;
-        acc3 += (half4)(in3.s1) * w;
-        acc4 += (half4)(in4.s1) * w;
-        acc5 += (half4)(in5.s1) * w;
-        acc6 += (half4)(in6.s1) * w;
-        acc7 += (half4)(in7.s1) * w;
+        // j=2
+        B.s0123 = read_imageh(src1, gy*2 + (i+2)*(n_4));
+        B.s4567 = read_imageh(src1, gy*2 + (i+2)*(n_4)+1);
+        dequantized_weights.s0 = (((bits4.s0 & (0x0F00)) >> 8) - 8) * scale.s0; // dequantize a row of the 16 weights
+        dequantized_weights.s1 = (((bits4.s1 & (0x0F00)) >> 8) - 8) * scale.s1;
+        dequantized_weights.s2 = (((bits4.s2 & (0x0F00)) >> 8) - 8) * scale.s2;
+        dequantized_weights.s3 = (((bits4.s3 & (0x0F00)) >> 8) - 8) * scale.s3;
+        c0 += B * dequantized_weights.s0; // vector-scalar multiplication to accumulate
+        c1 += B * dequantized_weights.s1;
+        c2 += B * dequantized_weights.s2;
+        c3 += B * dequantized_weights.s3;
 
-        // nibble j=2
-        w.s0 = (((bits4.s0 & 0x0F00) >> 8) - 8) * sc.s0;
-        w.s1 = (((bits4.s1 & 0x0F00) >> 8) - 8) * sc.s1;
-        w.s2 = (((bits4.s2 & 0x0F00) >> 8) - 8) * sc.s2;
-        w.s3 = (((bits4.s3 & 0x0F00) >> 8) - 8) * sc.s3;
-        acc0 += (half4)(in0.s2) * w;
-        acc1 += (half4)(in1.s2) * w;
-        acc2 += (half4)(in2.s2) * w;
-        acc3 += (half4)(in3.s2) * w;
-        acc4 += (half4)(in4.s2) * w;
-        acc5 += (half4)(in5.s2) * w;
-        acc6 += (half4)(in6.s2) * w;
-        acc7 += (half4)(in7.s2) * w;
-
-        // nibble j=3
-        w.s0 = (((bits4.s0 & 0xF000) >> 12) - 8) * sc.s0;
-        w.s1 = (((bits4.s1 & 0xF000) >> 12) - 8) * sc.s1;
-        w.s2 = (((bits4.s2 & 0xF000) >> 12) - 8) * sc.s2;
-        w.s3 = (((bits4.s3 & 0xF000) >> 12) - 8) * sc.s3;
-        acc0 += (half4)(in0.s3) * w;
-        acc1 += (half4)(in1.s3) * w;
-        acc2 += (half4)(in2.s3) * w;
-        acc3 += (half4)(in3.s3) * w;
-        acc4 += (half4)(in4.s3) * w;
-        acc5 += (half4)(in5.s3) * w;
-        acc6 += (half4)(in6.s3) * w;
-        acc7 += (half4)(in7.s3) * w;
+        // j=3
+        B.s0123 = read_imageh(src1, gy*2 + (i+3)*(n_4));
+        B.s4567 = read_imageh(src1, gy*2 + (i+3)*(n_4)+1);
+        dequantized_weights.s0 = (((bits4.s0 & (0xF000)) >> 12) - 8) * scale.s0; // dequantize a row of the 16 weights
+        dequantized_weights.s1 = (((bits4.s1 & (0xF000)) >> 12) - 8) * scale.s1;
+        dequantized_weights.s2 = (((bits4.s2 & (0xF000)) >> 12) - 8) * scale.s2;
+        dequantized_weights.s3 = (((bits4.s3 & (0xF000)) >> 12) - 8) * scale.s3;
+        c0 += B * dequantized_weights.s0; // vector-scalar multiplication to accumulate
+        c1 += B * dequantized_weights.s1;
+        c2 += B * dequantized_weights.s2;
+        c3 += B * dequantized_weights.s3;
     }
 
-    __local half4 sum0[WGS], sum1[WGS], sum2[WGS], sum3[WGS];
-    __local half4 sum4[WGS], sum5[WGS], sum6[WGS], sum7[WGS];
+    int idx = (gy<<3)*m + (gx<<2); // vectorized store 16 elements
 
-    if (lsz_k == 1) {
-        __global float *outp = dst + out_off;
-        if (out_b_idx + 0 < N) vstore4(convert_float4(acc0), 0, outp + 0*M);
-        if (out_b_idx + 1 < N) vstore4(convert_float4(acc1), 0, outp + 1*M);
-        if (out_b_idx + 2 < N) vstore4(convert_float4(acc2), 0, outp + 2*M);
-        if (out_b_idx + 3 < N) vstore4(convert_float4(acc3), 0, outp + 3*M);
-        if (out_b_idx + 4 < N) vstore4(convert_float4(acc4), 0, outp + 4*M);
-        if (out_b_idx + 5 < N) vstore4(convert_float4(acc5), 0, outp + 5*M);
-        if (out_b_idx + 6 < N) vstore4(convert_float4(acc6), 0, outp + 6*M);
-        if (out_b_idx + 7 < N) vstore4(convert_float4(acc7), 0, outp + 7*M);
-    } else {
-        const int slot = lid_m * lsz_k + lid_k;
-        sum0[slot] = acc0; sum1[slot] = acc1; sum2[slot] = acc2; sum3[slot] = acc3;
-        sum4[slot] = acc4; sum5[slot] = acc5; sum6[slot] = acc6; sum7[slot] = acc7;
-        barrier(CLK_LOCAL_MEM_FENCE);
-
-        for (int stride = lsz_k >> 1; stride > 0; stride >>= 1) {
-            if (lid_k < stride) {
-                const int my_slot = lid_m * lsz_k + lid_k;
-                const int partner_slot = lid_m * lsz_k + (lid_k + stride);
-                sum0[my_slot] += sum0[partner_slot];
-                sum1[my_slot] += sum1[partner_slot];
-                sum2[my_slot] += sum2[partner_slot];
-                sum3[my_slot] += sum3[partner_slot];
-                sum4[my_slot] += sum4[partner_slot];
-                sum5[my_slot] += sum5[partner_slot];
-                sum6[my_slot] += sum6[partner_slot];
-                sum7[my_slot] += sum7[partner_slot];
-            }
-            barrier(CLK_LOCAL_MEM_FENCE);
-        }
-
-        if (lid_k == 0) {
-            const int final_slot = lid_m * lsz_k;
-            __global float *outp = dst + out_off;
-            if (out_b_idx + 0 < N) vstore4(convert_float4(sum0[final_slot]), 0, outp + 0*M);
-            if (out_b_idx + 1 < N) vstore4(convert_float4(sum1[final_slot]), 0, outp + 1*M);
-            if (out_b_idx + 2 < N) vstore4(convert_float4(sum2[final_slot]), 0, outp + 2*M);
-            if (out_b_idx + 3 < N) vstore4(convert_float4(sum3[final_slot]), 0, outp + 3*M);
-            if (out_b_idx + 4 < N) vstore4(convert_float4(sum4[final_slot]), 0, outp + 4*M);
-            if (out_b_idx + 5 < N) vstore4(convert_float4(sum5[final_slot]), 0, outp + 5*M);
-            if (out_b_idx + 6 < N) vstore4(convert_float4(sum6[final_slot]), 0, outp + 6*M);
-            if (out_b_idx + 7 < N) vstore4(convert_float4(sum7[final_slot]), 0, outp + 7*M);
-        }
+    // conditional check if store is to a valid location. Required when N is not a multiple of 8
+    // if statements allow registers to be reused for each store
+    // provides a performance boost due to reduced register footprint, which increases number of concurrent waves
+    if(idx+3 < m*n_no_padding){
+        vstore4((float4)(c0.s0, c1.s0, c2.s0, c3.s0), 0, dst + idx);
+        idx += m;
+    }
+    if(idx+3 < m*n_no_padding){
+        vstore4((float4)(c0.s1, c1.s1, c2.s1, c3.s1), 0, dst + idx);
+        idx += m;
+    }
+    if(idx+3 < m*n_no_padding){
+        vstore4((float4)(c0.s2, c1.s2, c2.s2, c3.s2), 0, dst + idx);
+        idx += m;
+    }
+    if(idx+3 < m*n_no_padding){
+        vstore4((float4)(c0.s3, c1.s3, c2.s3, c3.s3), 0, dst + idx);
+        idx += m;
+    }
+    if(idx+3 < m*n_no_padding){
+        vstore4((float4)(c0.s4, c1.s4, c2.s4, c3.s4), 0, dst + idx);
+        idx += m;
+    }
+    if(idx+3 < m*n_no_padding){
+        vstore4((float4)(c0.s5, c1.s5, c2.s5, c3.s5), 0, dst + idx);
+        idx += m;
+    }
+    if(idx+3 < m*n_no_padding){
+        vstore4((float4)(c0.s6, c1.s6, c2.s6, c3.s6), 0, dst + idx);
+        idx += m;
+    }
+    if(idx+3 < m*n_no_padding){
+        vstore4((float4)(c0.s7, c1.s7, c2.s7, c3.s7), 0, dst + idx);
     }
 }

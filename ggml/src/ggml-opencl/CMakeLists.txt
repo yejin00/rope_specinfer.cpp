@@ -22,6 +22,15 @@ if (GGML_OPENCL_USE_ADRENO_KERNELS)
     add_compile_definitions(GGML_OPENCL_USE_ADRENO_KERNELS)
 endif ()
 
+# Ablation study: flash_attn_f32_f16_ablation.cl 사용 (0=Base, 1=+1Pass, 2=+TexK, 3=+DirectV, 4=+1QWave, 5=+NativeMath)
+if (GGML_OPENCL_USE_ABLATION)
+    message(STATUS "OpenCL flash_attn ablation study enabled (ABLATION_VARIANT=${ABLATION_VARIANT})")
+    add_compile_definitions(GGML_OPENCL_USE_ABLATION)
+    if (DEFINED ABLATION_VARIANT)
+        add_compile_definitions(ABLATION_VARIANT=${ABLATION_VARIANT})
+    endif ()
+endif ()
+
 if (GGML_OPENCL_EMBED_KERNELS)
     add_compile_definitions(GGML_OPENCL_EMBED_KERNELS)
 
@@ -70,6 +79,7 @@ set(GGML_OPENCL_KERNELS
     group_norm
     im2col_f32
     im2col_f16
+    mean
     mul_mat_Ab_Bi_8x4
     mul_mv_f16_f16
     mul_mv_f16_f32_1row
@@ -102,6 +112,7 @@ set(GGML_OPENCL_KERNELS
     rms_norm
     rope
     scale
+    crs_sparse_mul
     set_rows
     sigmoid
     silu
@@ -109,6 +120,9 @@ set(GGML_OPENCL_KERNELS
     softmax_4_f16
     softmax_f32
     softmax_f16
+    sqr
+    sqrt
+    ssm_conv
     sub
     sum_rows
     transpose
@@ -120,11 +134,17 @@ set(GGML_OPENCL_KERNELS
     repeat
     mul_mat_f16_f32
     mul_mm_f16_f32_kq_kqv
+    mul_mm_q4_0_f32_kq_kqv
     conv2d
     conv2d_f16_f32
     flash_attn_f32_f16
+    flash_attn_f32_f16_ablation
+    flash_attn_f32_f16_image
+    flash_attn_f32_f16_fa2
     flash_attn_f16
     flash_attn_f32
+    flash_attn_f32_q4_0
+    flash_attn_f32_q4_0_head
 )
 
 foreach (K ${GGML_OPENCL_KERNELS})

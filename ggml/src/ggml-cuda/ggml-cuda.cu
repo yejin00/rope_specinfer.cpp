@@ -17,6 +17,7 @@
 #include "ggml-cuda/conv2d-transpose.cuh"
 #include "ggml-cuda/convert.cuh"
 #include "ggml-cuda/count-equal.cuh"
+#include "ggml-cuda/crs-sparse-mul.cuh"
 #include "ggml-cuda/cpy.cuh"
 #include "ggml-cuda/cross-entropy-loss.cuh"
 #include "ggml-cuda/diagmask.cuh"
@@ -2434,6 +2435,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SET_ROWS:
             ggml_cuda_op_set_rows(ctx, dst);
             break;
+        case GGML_OP_CRS_SPARSE_MUL:
+            ggml_cuda_op_crs_sparse_mul(ctx, dst);
+            break;
         case GGML_OP_SET:
             ggml_cuda_op_set(ctx, dst);
             break;
@@ -4038,7 +4042,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_F32:
                     case GGML_TYPE_BF16:
                     case GGML_TYPE_I32:
+                    case GGML_TYPE_Q2_0:
                     case GGML_TYPE_Q4_0:
+                    case GGML_TYPE_Q4_0_Q2_0_HEAD:
+                    case GGML_TYPE_Q2_0_Q4_0_HEAD:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
@@ -4055,10 +4062,20 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_SET_ROWS:
             {
                 return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
-                       op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
+                       op->type == GGML_TYPE_Q2_0 || op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_0_HEAD || op->type == GGML_TYPE_Q4_0_Q2_0_HEAD || op->type == GGML_TYPE_Q2_0_Q4_0_HEAD || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
                        op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL) &&
                        op->src[0]->type == GGML_TYPE_F32 &&
                        (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
+            } break;
+        case GGML_OP_CRS_SPARSE_MUL:
+            {
+                return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
+                       op->src[0] != nullptr &&
+                       op->src[1] != nullptr &&
+                       op->src[2] != nullptr &&
+                       op->src[0]->type == op->type &&
+                       op->src[1]->type == GGML_TYPE_I32 &&
+                       op->src[2]->type == GGML_TYPE_F32;
             } break;
         case GGML_OP_SET:
             {
@@ -4074,6 +4091,24 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if ((src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_BF16 || src0_type == GGML_TYPE_F16) &&
                     (src1_type == GGML_TYPE_F32 || src1_type == GGML_TYPE_BF16 || src1_type == GGML_TYPE_F16)
                 ) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q2_0) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_Q2_0 && src1_type == GGML_TYPE_F32) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q4_0_Q2_0_HEAD) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_Q4_0_Q2_0_HEAD && src1_type == GGML_TYPE_F32) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q2_0_Q4_0_HEAD) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_Q2_0_Q4_0_HEAD && src1_type == GGML_TYPE_F32) {
                     return true;
                 }
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q8_0) {

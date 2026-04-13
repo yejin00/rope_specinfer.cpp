@@ -471,6 +471,16 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
 
     std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, true);
 
+    {
+    FILE * fp = fopen("tokens_llamacpp.txt", "w");
+    int n = std::min<int>(2000, tokens.size());
+    for (int i = 0; i < n; i++) {
+        fprintf(fp, "%d\t%d\n", i, (int)tokens[i]);
+    }
+    fclose(fp);
+    fprintf(stderr, "[LLAMA] dumped %d tokens -> tokens_llamacpp.txt\n", n);
+    }
+
     auto tim2 = std::chrono::high_resolution_clock::now();
     LOG_INF("%s: tokenization took %g ms\n",__func__,1e-3*std::chrono::duration_cast<std::chrono::microseconds>(tim2-tim1).count());
 
@@ -525,18 +535,14 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     }
 
     // We get the logits for all the tokens in the context window (params.n_ctx)
-    // from llama_decode below.  Now, based on https://huggingface.co/docs/transformers/perplexity,
-    // calculate the perplexity over the last half of the window (so the model always has
-    // some context to predict the token).
-    //
-    // We rely on the fact that attention in the forward pass only looks at previous
-    // tokens here, so the logits returned for each token are an accurate representation
-    // of what the model would have predicted at that point.
-    //
-    // Example, we have a context window of 512, we will compute perplexity for each of the
-    // last 256 tokens.  Then, we split the input up into context window size chunks to
-    // process the entire prompt.
-    const int first = n_ctx/2;
+    // from llama_decode below. By default we keep the historical llama.cpp behavior and
+    // evaluate perplexity over the last half of the window so the model always has context
+    // for the scored tokens. With --ppl-full-chunk we instead score the full chunk
+    // (except the first token, which has no previous-token context) to better match
+    // Hugging Face / RotateKV-style evaluation.
+    const int first = params.ppl_full_chunk ? 0 : n_ctx/2;
+    const int n_eval = n_ctx - first - 1;
+    const int n_logits_per_seq = n_ctx - first;
 
     for (int i = 0; i < n_chunk; i += n_seq) {
         const int start =     i * n_ctx;
@@ -562,8 +568,9 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
                 // save original token and restore it after decode
                 const auto token_org = tokens[seq_start];
 
-                // add BOS token for the first batch of each chunk
-                if (add_bos && j == 0) {
+                // Keep the default llama.cpp chunked-BOS behavior unless full-chunk
+                // perplexity is requested to mirror HF / RotateKV evaluation more closely.
+                if (add_bos && !params.ppl_full_chunk && j == 0) {
                     tokens[seq_start] = llama_vocab_bos(vocab);
                 }
 
@@ -609,21 +616,23 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
         }
 
         for (int seq = 0; seq < n_seq_batch; seq++) {
-            const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
+            const float * all_logits = num_batches > 1
+                ? logits.data() + size_t(seq*n_logits_per_seq) * n_vocab
+                : llama_get_logits_ith(ctx, seq*n_ctx + first);
 
             llama_token * tokens_data = tokens.data() + start + seq*n_ctx + first;
             if (!params.logits_file.empty()) {
                 process_logits(logits_stream, n_vocab, all_logits,
-                        tokens_data, n_ctx - 1 - first,
+                        tokens_data, n_eval,
                         workers, log_probs, nll, nll2);
             } else {
                 process_logits(n_vocab, all_logits,
-                        tokens_data, n_ctx - 1 - first,
+                        tokens_data, n_eval,
                         workers, nll, nll2,
                         logit_history.data() + start + seq*n_ctx + first,
                         prob_history.data()  + start + seq*n_ctx + first);
             }
-            count += n_ctx - first - 1;
+            count += n_eval;
 
             // perplexity is e^(average negative log-likelihood)
             if (params.ppl_output_type == 0) {

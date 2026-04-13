@@ -10,6 +10,11 @@
 #include "llama.h"
 #include "sampling.h"
 
+// CRS (Channel-wise Row Scaling) for KV cache quantization
+extern "C" {
+    #include "../ggml/src/ggml-cpu/crs-scales.h"
+}
+
 #include <algorithm>
 #include <cinttypes>
 #include <climits>
@@ -1032,6 +1037,23 @@ struct common_init_result common_init_from_params(common_params & params) {
         params.ctx_shift = false;
     }
 
+    if (params.pre_rope) {
+        LOG_WRN("%s: pre-RoPE KV mode is enabled\n", __func__);
+    }
+
+    // Initialize CRS (Channel-wise Row Scaling) for KV cache quantization
+    crs_init();
+    if (!params.crs_scales_k.empty()) {
+        LOG_WRN("%s: loading static CRS scales from '%s'\n", __func__, params.crs_scales_k.c_str());
+        if (crs_load_static_scales(params.crs_scales_k.c_str()) != 0) {
+            LOG_WRN("%s: failed to load CRS scales from '%s'\n", __func__, params.crs_scales_k.c_str());
+        }
+    }
+    if (params.crs_online_top_k > 0) {
+        LOG_WRN("%s: enabling online CRS with top-k = %d\n", __func__, params.crs_online_top_k);
+        crs_enable_online(params.crs_online_top_k, 0.0f);  // auto threshold
+    }
+
     if (!params.control_vectors.empty()) {
         if (params.control_vector_layer_start <= 0) params.control_vector_layer_start = 1;
         if (params.control_vector_layer_end   <= 0) params.control_vector_layer_end   = llama_model_n_layer(model);
@@ -1275,6 +1297,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
+    cparams.pre_rope          = params.pre_rope;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
