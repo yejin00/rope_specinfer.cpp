@@ -1249,6 +1249,9 @@ void ggml_compute_forward_acc(
         case GGML_TYPE_BF16:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_0_HEAD:
+        case GGML_TYPE_Q2_0_HEAD:
+        case GGML_TYPE_Q3_0_HEAD:
+        case GGML_TYPE_Q8_0_HEAD:
         case GGML_TYPE_Q4_0_Q2_0_HEAD:
         case GGML_TYPE_Q2_0_Q4_0_HEAD:
         case GGML_TYPE_Q4_1:
@@ -5587,6 +5590,9 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_BF16:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_0_HEAD:
+        case GGML_TYPE_Q2_0_HEAD:
+        case GGML_TYPE_Q3_0_HEAD:
+        case GGML_TYPE_Q8_0_HEAD:
         case GGML_TYPE_Q4_0_Q2_0_HEAD:
         case GGML_TYPE_Q2_0_Q4_0_HEAD:
         case GGML_TYPE_Q4_1:

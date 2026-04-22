@@ -188,6 +188,11 @@ extern "C" {
 
     LLAMA_API const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_type);
 
+    enum llama_hadamard_granularity {
+        LLAMA_HADAMARD_GRANULARITY_LAYER = 0,
+        LLAMA_HADAMARD_GRANULARITY_HEAD  = 1,
+    };
+
     enum llama_split_mode {
         LLAMA_SPLIT_MODE_NONE  = 0, // single GPU
         LLAMA_SPLIT_MODE_LAYER = 1, // split layers and KV across GPUs
@@ -345,6 +350,15 @@ extern "C" {
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
+        uint32_t hadamard_seed; // seed for randomized Hadamard sign generation
+        enum llama_hadamard_granularity hadamard_granularity; // randomized Hadamard sign granularity
+        int32_t sensitivity_layer; // target layer for KV sensitivity instrumentation
+        enum ggml_type sensitivity_baseline_type; // baseline KV type for instrumentation branch
+        enum ggml_type sensitivity_probe_type; // probe KV type for instrumentation branch
+        enum ggml_type sensitivity_baseline_k_type; // baseline K type for instrumentation branch
+        enum ggml_type sensitivity_baseline_v_type; // baseline V type for instrumentation branch
+        enum ggml_type sensitivity_probe_k_type; // probe K type for instrumentation branch
+        enum ggml_type sensitivity_probe_v_type; // probe V type for instrumentation branch
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -352,7 +366,7 @@ extern "C" {
         ggml_abort_callback abort_callback;
         void *              abort_callback_data;
 
-        // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
+        // Keep the booleans together near the end of the struct to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits)
         bool offload_kqv; // offload the KQV ops (including the KV cache) to GPU
         bool no_perf;     // measure performance timings
@@ -364,6 +378,12 @@ extern "C" {
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
         bool pre_rope;    // store K in KV cache before RoPE, apply RoPE at attention time
+        bool hadamard;    // apply the same fixed randomized Hadamard basis to Q and K post-RoPE
+        bool measure_kv_sensitivity; // enable layer-wise KV sensitivity instrumentation
+
+        const char * kv_layer_k_types; // optional layer-wise overrides for K cache types, e.g. "0-3:q4_0,4:q8_0"
+        const char * kv_layer_v_types; // optional layer-wise overrides for V cache types
+        const char * dump_attn_error;  // optional JSON output path for KV sensitivity metrics
     };
 
     // model quantization parameters

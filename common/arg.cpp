@@ -281,6 +281,9 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_Q8_0,
     GGML_TYPE_Q4_0,
     GGML_TYPE_Q4_0_HEAD,
+    GGML_TYPE_Q2_0_HEAD,
+    GGML_TYPE_Q3_0_HEAD,
+    GGML_TYPE_Q8_0_HEAD,
     GGML_TYPE_Q2_0,
     GGML_TYPE_Q4_0_Q2_0_HEAD,
     GGML_TYPE_Q2_0_Q4_0_HEAD,
@@ -305,6 +308,38 @@ static std::string get_all_kv_cache_types() {
         msg << ggml_type_name(type) << (&type == &kv_cache_types.back() ? "" : ", ");
     }
     return msg.str();
+}
+
+static void set_kv_layer_type_spec(std::string & dst, const std::string & value, const char * opt_name) {
+    const std::string spec = string_strip(value);
+    if (spec.empty()) {
+        throw std::runtime_error(string_format("%s: empty layer type spec", opt_name));
+    }
+
+    dst = spec;
+}
+
+static const char * hadamard_granularity_name(llama_hadamard_granularity granularity) {
+    switch (granularity) {
+        case LLAMA_HADAMARD_GRANULARITY_LAYER: return "layer";
+        case LLAMA_HADAMARD_GRANULARITY_HEAD:  return "head";
+    }
+
+    return "unknown";
+}
+
+static llama_hadamard_granularity hadamard_granularity_from_str(const std::string & value) {
+    if (value == "layer") {
+        return LLAMA_HADAMARD_GRANULARITY_LAYER;
+    }
+
+    if (value == "head") {
+        return LLAMA_HADAMARD_GRANULARITY_HEAD;
+    }
+
+    throw std::runtime_error(string_format(
+            "error: unknown value for --hadamard-granularity: '%s' (expected 'layer' or 'head')\n",
+            value.c_str()));
 }
 
 //
@@ -1023,6 +1058,131 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PRE_ROPE"));
     add_opt(common_arg(
+        {"--hadamard"},
+        "apply a fixed randomized Hadamard rotation to Q and K after RoPE",
+        [](common_params & params) {
+            params.hadamard = true;
+        }
+    ).set_env("LLAMA_ARG_HADAMARD"));
+    add_opt(common_arg(
+        {"--hadamard-seed"}, "N",
+        string_format("seed for randomized Hadamard sign generation (default: %u)", params.hadamard_seed),
+        [](common_params & params, int value) {
+            params.hadamard_seed = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_HADAMARD_SEED"));
+    add_opt(common_arg(
+        {"--hadamard-granularity"}, "TYPE",
+        string_format("Hadamard sign granularity ('layer' or 'head', default: %s)",
+            hadamard_granularity_name(params.hadamard_granularity)),
+        [](common_params & params, const std::string & value) {
+            params.hadamard_granularity = hadamard_granularity_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_HADAMARD_GRANULARITY"));
+    add_opt(common_arg(
+        {"--measure-kv-sensitivity"},
+        "enable layer-wise KV sensitivity instrumentation for a single target layer",
+        [](common_params & params) {
+            params.measure_kv_sensitivity = true;
+        }
+    ).set_env("LLAMA_ARG_MEASURE_KV_SENSITIVITY"));
+    add_opt(common_arg(
+        {"--sensitivity-layer"}, "N",
+        string_format("target layer for KV sensitivity measurement (default: %d)", params.sensitivity_layer),
+        [](common_params & params, int value) {
+            params.sensitivity_layer = value;
+        }
+    ).set_env("LLAMA_ARG_SENSITIVITY_LAYER"));
+    add_opt(common_arg(
+        {"--sensitivity-baseline-type"}, "TYPE",
+        string_format(
+            "baseline KV type for sensitivity instrumentation\n"
+            "allowed values: %s\n"
+            "(default: %s)",
+            get_all_kv_cache_types().c_str(),
+            ggml_type_name(params.sensitivity_baseline_type)
+        ),
+        [](common_params & params, const std::string & value) {
+            params.sensitivity_baseline_type = kv_cache_type_from_str(value);
+            params.sensitivity_baseline_k_type = params.sensitivity_baseline_type;
+            params.sensitivity_baseline_v_type = params.sensitivity_baseline_type;
+        }
+    ).set_env("LLAMA_ARG_SENSITIVITY_BASELINE_TYPE"));
+    add_opt(common_arg(
+        {"--sensitivity-probe-type"}, "TYPE",
+        string_format(
+            "probe KV type for sensitivity instrumentation\n"
+            "allowed values: %s\n"
+            "(default: %s)",
+            get_all_kv_cache_types().c_str(),
+            ggml_type_name(params.sensitivity_probe_type)
+        ),
+        [](common_params & params, const std::string & value) {
+            params.sensitivity_probe_type = kv_cache_type_from_str(value);
+            params.sensitivity_probe_k_type = params.sensitivity_probe_type;
+            params.sensitivity_probe_v_type = params.sensitivity_probe_type;
+        }
+    ).set_env("LLAMA_ARG_SENSITIVITY_PROBE_TYPE"));
+    add_opt(common_arg(
+        {"--sensitivity-baseline-k-type"}, "TYPE",
+        string_format(
+            "baseline K type for sensitivity instrumentation\n"
+            "allowed values: %s\n"
+            "(default: %s)",
+            get_all_kv_cache_types().c_str(),
+            ggml_type_name(params.sensitivity_baseline_k_type)
+        ),
+        [](common_params & params, const std::string & value) {
+            params.sensitivity_baseline_k_type = kv_cache_type_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_SENSITIVITY_BASELINE_K_TYPE"));
+    add_opt(common_arg(
+        {"--sensitivity-baseline-v-type"}, "TYPE",
+        string_format(
+            "baseline V type for sensitivity instrumentation\n"
+            "allowed values: %s\n"
+            "(default: %s)",
+            get_all_kv_cache_types().c_str(),
+            ggml_type_name(params.sensitivity_baseline_v_type)
+        ),
+        [](common_params & params, const std::string & value) {
+            params.sensitivity_baseline_v_type = kv_cache_type_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_SENSITIVITY_BASELINE_V_TYPE"));
+    add_opt(common_arg(
+        {"--sensitivity-probe-k-type"}, "TYPE",
+        string_format(
+            "probe K type for sensitivity instrumentation\n"
+            "allowed values: %s\n"
+            "(default: %s)",
+            get_all_kv_cache_types().c_str(),
+            ggml_type_name(params.sensitivity_probe_k_type)
+        ),
+        [](common_params & params, const std::string & value) {
+            params.sensitivity_probe_k_type = kv_cache_type_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_SENSITIVITY_PROBE_K_TYPE"));
+    add_opt(common_arg(
+        {"--sensitivity-probe-v-type"}, "TYPE",
+        string_format(
+            "probe V type for sensitivity instrumentation\n"
+            "allowed values: %s\n"
+            "(default: %s)",
+            get_all_kv_cache_types().c_str(),
+            ggml_type_name(params.sensitivity_probe_v_type)
+        ),
+        [](common_params & params, const std::string & value) {
+            params.sensitivity_probe_v_type = kv_cache_type_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_SENSITIVITY_PROBE_V_TYPE"));
+    add_opt(common_arg(
+        {"--dump-attn-error"}, "FNAME",
+        "JSON output path for KV sensitivity metrics",
+        [](common_params & params, const std::string & value) {
+            params.dump_attn_error = value;
+        }
+    ).set_env("LLAMA_ARG_DUMP_ATTN_ERROR"));
+    add_opt(common_arg(
         {"-p", "--prompt"}, "PROMPT",
         "prompt to start generation with; for system message, use -sys",
         [](common_params & params, const std::string & value) {
@@ -1672,6 +1832,34 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_type_v = kv_cache_type_from_str(value);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
+    add_opt(common_arg(
+        {"--kv-layer-types"}, "SPEC",
+        "layer-wise KV cache type overrides applied to both K and V\n"
+        "format: LAYERS:TYPE[,LAYERS:TYPE...]\n"
+        "LAYERS supports single indices, ranges, and lists such as 0, 3-7, or 0,2,5-7",
+        [](common_params & params, const std::string & value) {
+            set_kv_layer_type_spec(params.kv_layer_k_types, value, "--kv-layer-types");
+            set_kv_layer_type_spec(params.kv_layer_v_types, value, "--kv-layer-types");
+        }
+    ).set_env("LLAMA_ARG_KV_LAYER_TYPES"));
+    add_opt(common_arg(
+        {"--kv-layer-k-types"}, "SPEC",
+        "layer-wise KV cache type overrides for K only\n"
+        "format: LAYERS:TYPE[,LAYERS:TYPE...]\n"
+        "LAYERS supports single indices, ranges, and lists such as 0, 3-7, or 0,2,5-7",
+        [](common_params & params, const std::string & value) {
+            set_kv_layer_type_spec(params.kv_layer_k_types, value, "--kv-layer-k-types");
+        }
+    ).set_env("LLAMA_ARG_KV_LAYER_K_TYPES"));
+    add_opt(common_arg(
+        {"--kv-layer-v-types"}, "SPEC",
+        "layer-wise KV cache type overrides for V only\n"
+        "format: LAYERS:TYPE[,LAYERS:TYPE...]\n"
+        "LAYERS supports single indices, ranges, and lists such as 0, 3-7, or 0,2,5-7",
+        [](common_params & params, const std::string & value) {
+            set_kv_layer_type_spec(params.kv_layer_v_types, value, "--kv-layer-v-types");
+        }
+    ).set_env("LLAMA_ARG_KV_LAYER_V_TYPES"));
     add_opt(common_arg(
         {"--crs-scales-k"}, "FILE",
         "CRS (Channel-wise Row Scaling) scales file for K cache\n"

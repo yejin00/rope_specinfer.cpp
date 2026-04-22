@@ -17,9 +17,11 @@ add_library(llama
             llama-cparams.cpp
             llama-grammar.cpp
             llama-graph.cpp
+            llama-hadamard.cpp
             llama-hparams.cpp
             llama-impl.cpp
             llama-io.cpp
+            llama-kv-sensitivity.cpp
             llama-kv-cache.cpp
             llama-kv-cache-iswa.cpp
             llama-memory.cpp

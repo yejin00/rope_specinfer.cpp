@@ -5,6 +5,7 @@
 #include <map>
 #include <memory>
 #include <functional>
+#include <vector>
 
 struct llama_ubatch;
 
@@ -17,6 +18,9 @@ struct llama_memory_params {
     // kv cache
     ggml_type type_k;
     ggml_type type_v;
+    std::vector<ggml_type> layer_k_types;
+    std::vector<ggml_type> layer_v_types;
+    enum llama_flash_attn_type flash_attn_type;
 
     // use full-size SWA cache
     bool swa_full;

@@ -1,0 +1,7 @@
+Answer the grade school math word problem below, using step-by-step problem-solving process. Print the final answer after "####".
+
+Question:
+A roadwork company is paving a newly constructed 16-mile road. They use a mixture of pitch and gravel to make the asphalt to pave the road. Each truckloads of asphalt uses two bags of gravel and five times as many bags of gravel as it does barrels of pitch to make. It takes three truckloads of asphalt to pave each mile of road. The company paved 4 miles of road on one day, then one mile less than double that on the second day. How many barrels of pitch will the company need to finish the remaining road on the third day?
+
+Answer:
+Let's think step by step.

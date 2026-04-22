@@ -72,6 +72,12 @@ int main(void) {
     argv = {"binary_name", "--draft", "123"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_EMBEDDING));
 
+    // empty layer-wise KV cache spec
+    argv = {"binary_name", "--kv-layer-k-types", ""};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+
+    argv = {"binary_name", "--hadamard-granularity", "bad"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
     printf("test-arg-parser: test valid usage\n\n");
 
@@ -97,6 +103,75 @@ int main(void) {
     argv = {"binary_name", "--draft", "123"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.n_max == 123);
+
+    params = common_params();
+    argv = {"binary_name", "--kv-layer-types", "0-3:q4_0_head,4-7:q2_0_q4_0_head"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.kv_layer_k_types == "0-3:q4_0_head,4-7:q2_0_q4_0_head");
+    assert(params.kv_layer_v_types == "0-3:q4_0_head,4-7:q2_0_q4_0_head");
+
+    params = common_params();
+    argv = {"binary_name", "-ctv", "q2_0_head"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.cache_type_v == GGML_TYPE_Q2_0_HEAD);
+
+    params = common_params();
+    argv = {"binary_name", "-ctk", "q3_0_head"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.cache_type_k == GGML_TYPE_Q3_0_HEAD);
+
+    params = common_params();
+    argv = {"binary_name", "-ctv", "q8_0_head"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.cache_type_v == GGML_TYPE_Q8_0_HEAD);
+
+    params = common_params();
+    argv = {"binary_name", "--hadamard", "--hadamard-seed", "42", "--hadamard-granularity", "layer"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.hadamard == true);
+    assert(params.hadamard_seed == 42);
+    assert(params.hadamard_granularity == LLAMA_HADAMARD_GRANULARITY_LAYER);
+
+    params = common_params();
+    argv = {
+        "binary_name",
+        "--measure-kv-sensitivity",
+        "--sensitivity-layer", "13",
+        "--sensitivity-baseline-type", "q4_0_head",
+        "--sensitivity-probe-type", "q2_0_head",
+        "--dump-attn-error", "attn_error.json",
+    };
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.measure_kv_sensitivity == true);
+    assert(params.sensitivity_layer == 13);
+    assert(params.sensitivity_baseline_type == GGML_TYPE_Q4_0_HEAD);
+    assert(params.sensitivity_probe_type == GGML_TYPE_Q2_0_HEAD);
+    assert(params.sensitivity_baseline_k_type == GGML_TYPE_Q4_0_HEAD);
+    assert(params.sensitivity_baseline_v_type == GGML_TYPE_Q4_0_HEAD);
+    assert(params.sensitivity_probe_k_type == GGML_TYPE_Q2_0_HEAD);
+    assert(params.sensitivity_probe_v_type == GGML_TYPE_Q2_0_HEAD);
+    assert(params.dump_attn_error == "attn_error.json");
+
+    params = common_params();
+    argv = {
+        "binary_name",
+        "--measure-kv-sensitivity",
+        "--sensitivity-baseline-k-type", "q4_0_head",
+        "--sensitivity-baseline-v-type", "q4_0_head",
+        "--sensitivity-probe-k-type", "q4_0_head",
+        "--sensitivity-probe-v-type", "q2_0_head",
+    };
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.sensitivity_baseline_k_type == GGML_TYPE_Q4_0_HEAD);
+    assert(params.sensitivity_baseline_v_type == GGML_TYPE_Q4_0_HEAD);
+    assert(params.sensitivity_probe_k_type == GGML_TYPE_Q4_0_HEAD);
+    assert(params.sensitivity_probe_v_type == GGML_TYPE_Q2_0_HEAD);
+
+    params = common_params();
+    argv = {"binary_name", "--kv-layer-types", "0-3:q4_0_head", "--kv-layer-v-types", "0,2,5:q4_0"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.kv_layer_k_types == "0-3:q4_0_head");
+    assert(params.kv_layer_v_types == "0,2,5:q4_0");
 
 // skip this part on windows, because setenv is not supported
 #ifdef _WIN32

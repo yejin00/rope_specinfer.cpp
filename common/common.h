@@ -411,6 +411,8 @@ struct common_params {
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
     bool pre_rope          = false; // store K before RoPE, apply RoPE at attention time
+    bool hadamard          = false; // apply a fixed randomized Hadamard basis to Q/K post-RoPE
+    bool measure_kv_sensitivity = false; // enable layer-wise KV sensitivity instrumentation
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool use_mmap          = true;  // use mmap for faster loads
@@ -428,6 +430,18 @@ struct common_params {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    uint32_t hadamard_seed = 0;             // fixed seed for randomized Hadamard sign generation
+    llama_hadamard_granularity hadamard_granularity = LLAMA_HADAMARD_GRANULARITY_HEAD;
+    std::string kv_layer_k_types;           // optional layer-wise KV cache type overrides for K
+    std::string kv_layer_v_types;           // optional layer-wise KV cache type overrides for V
+    int32_t sensitivity_layer = -1;         // target layer for KV sensitivity measurement
+    ggml_type sensitivity_baseline_type = GGML_TYPE_Q4_0_HEAD; // baseline KV type for instrumentation branch
+    ggml_type sensitivity_probe_type    = GGML_TYPE_Q2_0_HEAD; // probe KV type for instrumentation branch
+    ggml_type sensitivity_baseline_k_type = GGML_TYPE_Q4_0_HEAD; // baseline K type for instrumentation branch
+    ggml_type sensitivity_baseline_v_type = GGML_TYPE_Q4_0_HEAD; // baseline V type for instrumentation branch
+    ggml_type sensitivity_probe_k_type    = GGML_TYPE_Q2_0_HEAD; // probe K type for instrumentation branch
+    ggml_type sensitivity_probe_v_type    = GGML_TYPE_Q2_0_HEAD; // probe V type for instrumentation branch
+    std::string dump_attn_error;            // JSON output path for KV sensitivity metrics
 
     std::string crs_scales_k;              // CRS scales file for K cache (static outliers)
     int32_t     crs_online_top_k = 0;      // Online CRS top-k (0 = disabled)

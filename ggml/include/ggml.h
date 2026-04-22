@@ -422,7 +422,10 @@ extern "C" {
         GGML_TYPE_Q2_0    = 41,   // Q2_0 with block size 32
         GGML_TYPE_Q4_0_Q2_0_HEAD = 42, // mixed KV cache: first 64 dims q4_0, last 64 dims q2_0
         GGML_TYPE_Q2_0_Q4_0_HEAD = 43, // mixed KV cache: first 64 dims q2_0, last 64 dims q4_0
-        GGML_TYPE_COUNT   = 44,
+        GGML_TYPE_Q2_0_HEAD = 44, // Q2_0 with block size 128 (per-head KV cache quantization)
+        GGML_TYPE_Q3_0_HEAD = 45, // Q3_0 with block size 128 (per-head KV cache quantization)
+        GGML_TYPE_Q8_0_HEAD = 46, // Q8_0 with block size 128 (per-head KV cache quantization)
+        GGML_TYPE_COUNT   = 47,
     };
 
     // precision

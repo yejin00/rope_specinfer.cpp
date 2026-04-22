@@ -1298,9 +1298,23 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
     cparams.pre_rope          = params.pre_rope;
+    cparams.hadamard          = params.hadamard;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
+    cparams.hadamard_seed = params.hadamard_seed;
+    cparams.hadamard_granularity = params.hadamard_granularity;
+    cparams.sensitivity_layer = params.sensitivity_layer;
+    cparams.sensitivity_baseline_type = params.sensitivity_baseline_type;
+    cparams.sensitivity_probe_type = params.sensitivity_probe_type;
+    cparams.sensitivity_baseline_k_type = params.sensitivity_baseline_k_type;
+    cparams.sensitivity_baseline_v_type = params.sensitivity_baseline_v_type;
+    cparams.sensitivity_probe_k_type = params.sensitivity_probe_k_type;
+    cparams.sensitivity_probe_v_type = params.sensitivity_probe_v_type;
+    cparams.kv_layer_k_types = params.kv_layer_k_types.empty() ? nullptr : params.kv_layer_k_types.c_str();
+    cparams.kv_layer_v_types = params.kv_layer_v_types.empty() ? nullptr : params.kv_layer_v_types.c_str();
+    cparams.dump_attn_error = params.dump_attn_error.empty() ? nullptr : params.dump_attn_error.c_str();
+    cparams.measure_kv_sensitivity = params.measure_kv_sensitivity;
 
     return cparams;
 }

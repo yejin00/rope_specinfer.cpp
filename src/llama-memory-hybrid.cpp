@@ -11,8 +11,9 @@
 llama_memory_hybrid::llama_memory_hybrid(
         const llama_model & model,
                             /* attn */
-                ggml_type   type_k,
-                ggml_type   type_v,
+        const std::vector<ggml_type> & layer_types_k,
+        const std::vector<ggml_type> & layer_types_v,
+         llama_flash_attn_type   flash_attn_type,
                      bool   v_trans,
                  uint32_t   kv_size,
                  uint32_t   n_pad,
@@ -32,8 +33,9 @@ llama_memory_hybrid::llama_memory_hybrid(
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
-        type_k,
-        type_v,
+        layer_types_k,
+        layer_types_v,
+        flash_attn_type,
         v_trans,
         offload,
         unified,

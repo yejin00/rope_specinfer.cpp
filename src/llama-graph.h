@@ -39,6 +39,8 @@ void qk_dist_q_update(int layer, const float * data, int64_t n_head, int64_t hea
 void qk_dist_k_update(int layer, const float * data, int64_t n_head, int64_t head_dim, int64_t n_tokens);
 
 struct llama_cparams;
+struct llama_hadamard_tensors;
+struct llama_kv_sensitivity_state;
 
 struct llama_memory_context_i;
 
@@ -464,6 +466,9 @@ struct llm_graph_params {
 
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
+    const llama_hadamard_tensors * hadamard;
+    llama_kv_sensitivity_state   * kv_sensitivity;
+    bool                           kv_sensitivity_active = false;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
@@ -513,6 +518,16 @@ struct llm_graph_params {
             gtype     == other.gtype &&
             cvec      == other.cvec  &&
             loras     == other.loras &&
+            cparams.hadamard == other.cparams.hadamard &&
+            cparams.measure_kv_sensitivity == other.cparams.measure_kv_sensitivity &&
+            cparams.sensitivity_layer == other.cparams.sensitivity_layer &&
+            cparams.sensitivity_baseline_type == other.cparams.sensitivity_baseline_type &&
+            cparams.sensitivity_probe_type == other.cparams.sensitivity_probe_type &&
+            cparams.sensitivity_baseline_k_type == other.cparams.sensitivity_baseline_k_type &&
+            cparams.sensitivity_baseline_v_type == other.cparams.sensitivity_baseline_v_type &&
+            cparams.sensitivity_probe_k_type == other.cparams.sensitivity_probe_k_type &&
+            cparams.sensitivity_probe_v_type == other.cparams.sensitivity_probe_v_type &&
+            kv_sensitivity_active == other.kv_sensitivity_active &&
             cross     == other.cross &&
             n_outputs == other.n_outputs;
     }
@@ -631,6 +646,9 @@ struct llm_graph_context {
 
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
+    const llama_hadamard_tensors * hadamard;
+    llama_kv_sensitivity_state   * kv_sensitivity;
+    const bool                     kv_sensitivity_active;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
@@ -756,6 +774,30 @@ struct llm_graph_context {
             ggml_tensor * kq_mask,
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
+                  float   kq_scale,
+                    int   il) const;
+
+    ggml_tensor * build_hadamard_rotated(
+            ggml_tensor * cur,
+            ggml_tensor * signs,
+            const char  * name,
+                    int   il) const;
+
+    ggml_tensor * build_kv_sensitivity_quantized(
+            ggml_tensor * cur,
+              ggml_type   type,
+            bool          apply_crs,
+              const char * name,
+                    int   il) const;
+
+    void build_kv_sensitivity_measurement(
+            ggml_tensor * q_cur,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+            ggml_tensor * kq_b,
+            ggml_tensor * kq_mask,
+            ggml_tensor * sinks,
+            ggml_tensor * v_mla,
                   float   kq_scale,
                     int   il) const;
 

@@ -78,8 +78,9 @@ public:
 
     llama_kv_cache(
             const llama_model & model,
-                    ggml_type   type_k,
-                    ggml_type   type_v,
+        const std::vector<ggml_type> & layer_types_k,
+        const std::vector<ggml_type> & layer_types_v,
+         llama_flash_attn_type   flash_attn_type,
                          bool   v_trans,
                          bool   offload,
                          bool   unified,

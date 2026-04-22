@@ -47,6 +47,43 @@ static __device__ __forceinline__ void dequantize_q4_0_head(const void * vx, con
     v.y = (v.y - 8.0f) * d;
 }
 
+static __device__ __forceinline__ void dequantize_q2_0_head(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_q2_0_head * x = (const block_q2_0_head *) vx;
+
+    const float d = x[ib].d;
+
+    const int q = x[ib].qs[iqs & 0x1f];
+    if (iqs < 32) {
+        v.x = (q >> 0) & 0x03;
+        v.y = (q >> 2) & 0x03;
+    } else {
+        v.x = (q >> 4) & 0x03;
+        v.y = (q >> 6) & 0x03;
+    }
+
+    v.x = (v.x - 2.0f) * d;
+    v.y = (v.y - 2.0f) * d;
+}
+
+static __device__ __forceinline__ int dequantize_q3_0_head_get_code(const block_q3_0_head * x, const int ir) {
+    const uint8_t q = x->qs[ir & 0x1f];
+    const uint8_t low = (ir < 32 ? (q >> 0) : (ir < 64 ? (q >> 4) : (ir < 96 ? (q >> 2) : (q >> 6)))) & 0x03;
+    const uint8_t high = (x->qh[ir >> 3] >> (ir & 0x07)) & 0x01;
+    return low | (high << 2);
+}
+
+static __device__ __forceinline__ void dequantize_q3_0_head(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_q3_0_head * x = (const block_q3_0_head *) vx;
+
+    const float d = x[ib].d;
+
+    v.x = dequantize_q3_0_head_get_code(&x[ib], iqs + 0);
+    v.y = dequantize_q3_0_head_get_code(&x[ib], iqs + QK3_0_HEAD/2);
+
+    v.x = (v.x - 4.0f) * d;
+    v.y = (v.y - 4.0f) * d;
+}
+
 static __device__ __forceinline__ void dequantize_q4_0_q2_0_head(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q4_0_q2_0_head * x = (const block_q4_0_q2_0_head *) vx;
 
@@ -143,6 +180,18 @@ static __device__ __forceinline__ void dequantize_q5_1(const void * vx, const in
 
 static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q8_0 * x = (const block_q8_0 *) vx;
+
+    const float d = x[ib].d;
+
+    v.x = x[ib].qs[iqs + 0];
+    v.y = x[ib].qs[iqs + 1];
+
+    v.x *= d;
+    v.y *= d;
+}
+
+static __device__ __forceinline__ void dequantize_q8_0_head(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_q8_0_head * x = (const block_q8_0_head *) vx;
 
     const float d = x[ib].d;
 

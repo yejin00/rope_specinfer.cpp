@@ -3,6 +3,8 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
+#include "llama-hadamard.h"
+#include "llama-kv-sensitivity.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -15,10 +17,12 @@ extern "C" {
 }
 
 #include <cassert>
+#include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include <vector>
 #include <string>
 #include <mutex>
@@ -1202,6 +1206,9 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     backend_cpu      (params.backend_cpu),
     cvec             (params.cvec),
     loras            (params.loras),
+    hadamard         (params.hadamard),
+    kv_sensitivity   (params.kv_sensitivity),
+    kv_sensitivity_active(params.kv_sensitivity_active),
     mctx             (params.mctx),
     cross            (params.cross),
     cb_func          (params.cb),
@@ -1215,6 +1222,224 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
     if (cb_func) {
         cb_func(ubatch, cur, name, il);
     }
+}
+
+ggml_tensor * llm_graph_context::build_hadamard_rotated(
+        ggml_tensor * cur,
+        ggml_tensor * signs,
+        const char  * name,
+                int   il) const {
+    if (hadamard == nullptr || !hadamard->enabled) {
+        return cur;
+    }
+
+    if (cur == nullptr || signs == nullptr) {
+        throw std::runtime_error(format("%s: missing Hadamard tensors for layer %d", __func__, il));
+    }
+
+    if (cur->ne[0] != hadamard->head_dim) {
+        throw std::runtime_error(format(
+                "%s: Hadamard head dim mismatch for %s at layer %d: expected %d, got %" PRId64,
+                __func__, name, il, hadamard->head_dim, cur->ne[0]));
+    }
+
+    if (signs->ne[0] != cur->ne[0] || signs->ne[1] != cur->ne[1]) {
+        throw std::runtime_error(format(
+                "%s: Hadamard sign shape mismatch for %s at layer %d", __func__, name, il));
+    }
+
+    ggml_tensor * signs3 = ggml_reshape_3d(ctx0, signs, signs->ne[0], signs->ne[1], 1);
+    ggml_tensor * signed_cur = ggml_mul(ctx0, cur, ggml_repeat(ctx0, signs3, cur));
+    cb(signed_cur, format("%s_hadamard_sign", name).c_str(), il);
+
+    ggml_tensor * rotated = ggml_mul_mat(ctx0, hadamard->matrix, signed_cur);
+    cb(rotated, format("%s_hadamard", name).c_str(), il);
+
+    if (rotated->type != cur->type) {
+        rotated = ggml_cast(ctx0, rotated, cur->type);
+        cb(rotated, format("%s_hadamard_cast", name).c_str(), il);
+    }
+
+    if (ggml_row_size(rotated->type, rotated->ne[0]) != rotated->nb[1]) {
+        rotated = ggml_cont(ctx0, rotated);
+        cb(rotated, format("%s_hadamard_cont", name).c_str(), il);
+    }
+
+    return rotated;
+}
+
+ggml_tensor * llm_graph_context::build_kv_sensitivity_quantized(
+        ggml_tensor * cur,
+          ggml_type   type,
+        bool          apply_crs,
+          const char * name,
+                int   il) const {
+    GGML_ASSERT(cur != nullptr);
+
+    ggml_tensor * cur_f32 = cur->type == GGML_TYPE_F32 ? cur : ggml_cast(ctx0, cur, GGML_TYPE_F32);
+    if (!ggml_is_contiguous(cur_f32)) {
+        cur_f32 = ggml_cont(ctx0, cur_f32);
+    }
+
+    if (apply_crs && g_crs_static.enabled) {
+        auto * params = new crs_restore_params{il, (int32_t) cur_f32->ne[1], (int32_t) cur_f32->ne[0]};
+        cur_f32 = ggml_map_custom1(ctx0, cur_f32, crs_apply_op, 1, params);
+        ggml_format_name(cur_f32, "%s_crs_applied_l%d", name, il);
+    }
+
+    ggml_tensor * quantized_storage = ggml_new_tensor(ctx0, type, GGML_MAX_DIMS, cur_f32->ne);
+    ggml_format_name(quantized_storage, "%s_storage_l%d", name, il);
+
+    ggml_tensor * quantized = ggml_cpy(ctx0, cur_f32, quantized_storage);
+    ggml_tensor * dequantized = ggml_cast(ctx0, quantized, GGML_TYPE_F32);
+
+    if (apply_crs && g_crs_static.enabled) {
+        auto * params = new crs_restore_params{il, (int32_t) dequantized->ne[1], (int32_t) dequantized->ne[0]};
+        dequantized = ggml_map_custom1(ctx0, dequantized, crs_restore_op, 1, params);
+        ggml_format_name(dequantized, "%s_crs_restored_l%d", name, il);
+    }
+
+    return dequantized;
+}
+
+void llm_graph_context::build_kv_sensitivity_measurement(
+        ggml_tensor * q_cur,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        ggml_tensor * kq_b,
+        ggml_tensor * kq_mask,
+        ggml_tensor * sinks,
+        ggml_tensor * v_mla,
+            float     kq_scale,
+            int       il) const {
+    if (kv_sensitivity == nullptr || !kv_sensitivity_active || !cparams.measure_kv_sensitivity || il != cparams.sensitivity_layer) {
+        return;
+    }
+
+    // Skip single-token decode steps so the measurement captures prompt-prefill behavior only.
+    if (n_tokens <= 1) {
+        return;
+    }
+
+    auto build_branch = [&](ggml_tensor * q_in, ggml_tensor * k_in, ggml_tensor * v_in, const char * tag) {
+        const bool v_trans = v_in->nb[1] > v_in->nb[2];
+        const auto n_stream = k_in->ne[3];
+        const auto n_q = q_in->ne[2] / n_stream;
+        const auto n_k = k_in->ne[2];
+
+        ggml_tensor * q = ggml_view_4d(ctx0, q_in, q_in->ne[0], q_in->ne[1], q_in->ne[2]/n_stream, n_stream, q_in->nb[1], q_in->nb[2], q_in->nb[3]/n_stream, 0);
+        ggml_tensor * k = k_in;
+        ggml_tensor * v = v_in;
+        ggml_tensor * kq_mask_local = kq_mask;
+
+        q = ggml_permute(ctx0, q, 0, 2, 1, 3);
+        k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+        v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+
+        if (kq_mask_local != nullptr) {
+            const int64_t padded_q = GGML_PAD(n_q, GGML_KQ_MASK_PAD);
+
+            if (kq_mask_local->ne[0] != n_k || kq_mask_local->ne[1] != padded_q) {
+                GGML_ASSERT(kq_mask_local->ne[0] >= n_k);
+                GGML_ASSERT(kq_mask_local->ne[1] >= padded_q);
+
+                kq_mask_local = ggml_view_4d(
+                        ctx0,
+                        kq_mask_local,
+                        n_k,
+                        padded_q,
+                        kq_mask_local->ne[2],
+                        kq_mask_local->ne[3],
+                        kq_mask_local->nb[1],
+                        kq_mask_local->nb[2],
+                        kq_mask_local->nb[3],
+                        0);
+                ggml_format_name(kq_mask_local, "kv_sens_%s_kq_mask_l%d", tag, il);
+            }
+
+            if (!ggml_is_contiguous(kq_mask_local)) {
+                kq_mask_local = ggml_cont(ctx0, kq_mask_local);
+                ggml_format_name(kq_mask_local, "kv_sens_%s_kq_mask_cont_l%d", tag, il);
+            }
+        }
+
+        ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
+        ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+        ggml_format_name(kq, "kv_sens_%s_kq_l%d", tag, il);
+
+        if (arch == LLM_ARCH_GROK) {
+            kq = ggml_tanh(ctx0, ggml_scale(ctx0, kq, hparams.f_attn_out_scale / hparams.f_attn_logit_softcapping));
+            kq = ggml_scale(ctx0, kq, hparams.f_attn_logit_softcapping);
+        }
+
+        if (hparams.attn_soft_cap) {
+            kq = ggml_scale(ctx0, kq, 1.0f / hparams.f_attn_logit_softcapping);
+            kq = ggml_tanh(ctx0, kq);
+            kq = ggml_scale(ctx0, kq, hparams.f_attn_logit_softcapping);
+        }
+
+        if (kq_b) {
+            kq = ggml_add(ctx0, kq, kq_b);
+        }
+
+        kq = ggml_soft_max_ext(ctx0, kq, kq_mask_local, kq_scale, hparams.f_max_alibi_bias);
+        ggml_soft_max_add_sinks(kq, sinks);
+        ggml_format_name(kq, "kv_sens_%s_score_l%d", tag, il);
+
+        if (!v_trans) {
+            v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
+        }
+
+        ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
+        if (v_mla) {
+            kqv = ggml_mul_mat(ctx0, v_mla, kqv);
+        }
+
+        ggml_tensor * cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
+        cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+        ggml_format_name(cur, "kv_sens_%s_out_l%d", tag, il);
+
+        return std::make_pair(kq, cur);
+    };
+
+    ggml_tensor * q_ref = q_cur->type == GGML_TYPE_F32 ? q_cur : ggml_cast(ctx0, q_cur, GGML_TYPE_F32);
+    ggml_tensor * k_ref = k_cur->type == GGML_TYPE_F32 ? k_cur : ggml_cast(ctx0, k_cur, GGML_TYPE_F32);
+    ggml_tensor * v_ref = v_cur->type == GGML_TYPE_F32 ? v_cur : ggml_cast(ctx0, v_cur, GGML_TYPE_F32);
+
+    ggml_tensor * k_baseline = build_kv_sensitivity_quantized(k_ref, cparams.sensitivity_baseline_k_type, true,  "kv_sens_k_baseline", il);
+    ggml_tensor * v_baseline = build_kv_sensitivity_quantized(v_ref, cparams.sensitivity_baseline_v_type, false, "kv_sens_v_baseline", il);
+    ggml_tensor * k_probe    = build_kv_sensitivity_quantized(k_ref, cparams.sensitivity_probe_k_type,    true,  "kv_sens_k_probe",    il);
+    ggml_tensor * v_probe    = build_kv_sensitivity_quantized(v_ref, cparams.sensitivity_probe_v_type,    false, "kv_sens_v_probe",    il);
+
+    const auto ref_branch      = build_branch(q_ref, k_ref,      v_ref,      "ref");
+    const auto baseline_branch = build_branch(q_ref, k_baseline, v_baseline, "baseline");
+    const auto probe_branch    = build_branch(q_ref, k_probe,    v_probe,    "probe");
+
+    auto * score_params = new llama_kv_sensitivity_capture_params{kv_sensitivity};
+    ggml_tensor * score_capture = ggml_map_custom3(
+            ctx0,
+            ref_branch.first,
+            baseline_branch.first,
+            probe_branch.first,
+            llama_kv_sensitivity_capture_score_op,
+            1,
+            score_params);
+    ggml_format_name(score_capture, "kv_sensitivity_score_capture_l%d", il);
+    ggml_backend_sched_set_tensor_backend(sched, score_capture, backend_cpu);
+    ggml_build_forward_expand(gf, score_capture);
+
+    auto * output_params = new llama_kv_sensitivity_capture_params{kv_sensitivity};
+    ggml_tensor * output_capture = ggml_map_custom3(
+            ctx0,
+            ref_branch.second,
+            baseline_branch.second,
+            probe_branch.second,
+            llama_kv_sensitivity_capture_output_op,
+            1,
+            output_params);
+    ggml_format_name(output_capture, "kv_sensitivity_output_capture_l%d", il);
+    ggml_backend_sched_set_tensor_backend(sched, output_capture, backend_cpu);
+    ggml_build_forward_expand(gf, output_capture);
 }
 
 ggml_tensor * llm_graph_context::build_cvec(
@@ -2189,6 +2414,11 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = k_cur;
     ggml_tensor * v = v_cur;
 
+    if (hadamard && hadamard->enabled) {
+        q = build_hadamard_rotated(q, hadamard->q_signs.at(il), "Qcur", il);
+        k = build_hadamard_rotated(k, hadamard->k_signs.at(il), "Kcur", il);
+    }
+
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
@@ -2266,16 +2496,24 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_cur = inp->mctx;
 
+    ggml_tensor * q = q_cur;
+    ggml_tensor * k_store_src = k_cur;
+
+    if (hadamard && hadamard->enabled) {
+        q = build_hadamard_rotated(q, hadamard->q_signs.at(il), "Qcur", il);
+        k_store_src = build_hadamard_rotated(k_store_src, hadamard->k_signs.at(il), "Kcur", il);
+    }
+
     // store to KV cache
     {
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
         // Apply CRS scale before storing to cache (suppress outliers)
-        ggml_tensor * k_to_store = k_cur;
+        ggml_tensor * k_to_store = k_store_src;
         if (g_crs_static.enabled) {
             crs_restore_params * params = new crs_restore_params{il, (int32_t)hparams.n_head_kv(), (int32_t)hparams.n_embd_head_k};
-            k_to_store = ggml_map_custom1(ctx0, k_cur, crs_apply_op, GGML_N_TASKS_MAX, params);
+            k_to_store = ggml_map_custom1(ctx0, k_store_src, crs_apply_op, GGML_N_TASKS_MAX, params);
             ggml_format_name(k_to_store, "k_crs_applied_l%d", il);
         }
 
@@ -2296,7 +2534,10 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto & kq_mask = inp->get_kq_mask();
 
-    ggml_tensor * q = q_cur;
+    if (kv_sensitivity_active && cparams.measure_kv_sensitivity && il == cparams.sensitivity_layer) {
+        build_kv_sensitivity_measurement(q, k_store_src, v_cur, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    }
+
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
@@ -2398,12 +2639,22 @@ ggml_tensor * llm_graph_context::build_attn(
     const bool is_swa = hparams.is_swa(il);
 
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
+    ggml_tensor * q = q_cur;
+
+    if (hadamard && hadamard->enabled) {
+        q = build_hadamard_rotated(q, hadamard->q_signs.at(il), "Qcur", il);
+    }
 
     // optionally store to KV cache
     if (k_cur) {
         const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
+        ggml_tensor * k_to_store = k_cur;
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        if (hadamard && hadamard->enabled) {
+            k_to_store = build_hadamard_rotated(k_to_store, hadamard->k_signs.at(il), "Kcur", il);
+        }
+
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_to_store, k_idxs, il));
     }
 
     if (v_cur) {
@@ -2414,7 +2665,6 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
 
-    ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
@@ -2472,6 +2722,11 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k = k_cur;
     ggml_tensor * v = v_cur;
+
+    if (hadamard && hadamard->enabled) {
+        q = build_hadamard_rotated(q, hadamard->q_signs.at(il), "Qcur", il);
+        k = build_hadamard_rotated(k, hadamard->k_signs.at(il), "Kcur", il);
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);

@@ -1,0 +1,16 @@
+{
+  "layer": 0,
+  "n_layer": 32,
+  "baseline_type": "q4_0_head",
+  "probe_type": "q2_0_head",
+  "baseline_ea": 0.0,
+  "probe_ea": 0.0,
+  "delta_ea": 0.0,
+  "baseline_eo": 0.0,
+  "probe_eo": 0.0,
+  "delta_eo": 0.0,
+  "score_elements": 0,
+  "output_elements": 0,
+  "score_captures": 0,
+  "output_captures": 0
+}

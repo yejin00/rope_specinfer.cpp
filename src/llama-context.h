@@ -13,6 +13,8 @@
 
 struct llama_model;
 class llama_batch_allocr;
+struct llama_hadamard_tensors;
+struct llama_kv_sensitivity_state;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -222,7 +224,8 @@ private:
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
+                          llm_graph_type   gtype,
+                                    bool   kv_sensitivity_active = true) const;
 
     llm_graph_cb graph_get_cb() const;
 
@@ -244,6 +247,9 @@ private:
     llama_adapter_loras loras;
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
+
+    std::unique_ptr<llama_hadamard_tensors> hadamard;
+    std::unique_ptr<llama_kv_sensitivity_state> kv_sensitivity;
 
     std::unique_ptr<llama_memory_i> memory;
 

@@ -189,7 +189,7 @@ def build_needle(kind: str, seed: int, digits: int, format_mode: str) -> NeedleS
         return NeedleSpec(
             kind=kind,
             answer=answer,
-            needle_text=f"The pass key is {answer}. Remember it. {answer} is the pass key.",
+            needle_text=f"A handwritten note says the temporary pass key for this file was {answer}.",
             question=question,
             answer_pattern=rf"\b\d{{{digits}}}\b",
         )
@@ -256,9 +256,9 @@ def build_needle(kind: str, seed: int, digits: int, format_mode: str) -> NeedleS
 def extract_answer(text: str, spec: NeedleSpec) -> str:
     if spec.kind == "passkey":
         normalized = text.replace(",", "")
-        match = re.search(spec.answer_pattern, normalized)
-        if match:
-            return match.group(0)
+        matches = re.findall(spec.answer_pattern, normalized)
+        if matches:
+            return matches[-1]
         groups = re.findall(r"\d+", normalized)
         if groups:
             return max(groups, key=len)
@@ -452,11 +452,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         description="Run a Needle In A Haystack retrieval sweep against llama-server.",
     )
     parser.add_argument("--base-url", default="http://127.0.0.1:8080", help="llama-server base URL")
-    parser.add_argument("--ctx-lens", default="8192,16384,32768,65536", help="Comma-separated context lengths")
+    parser.add_argument("--ctx-lens", default="2048,4096,8192,16384,32768,51200,65536", help="Comma-separated context lengths")
     parser.add_argument("--depths", default="0.1,0.3,0.5,0.7,0.9", help="Comma-separated insertion depths")
-    parser.add_argument("--seeds", default="0,1,2,3,4", help="Comma-separated per-trial seeds")
+    parser.add_argument("--seeds", default="0", help="Comma-separated per-trial seeds")
     parser.add_argument("--needle-kind", choices=("passkey", "word", "kv"), default="passkey")
-    parser.add_argument("--digits", type=int, default=5, help="Number of digits for passkey mode")
+    parser.add_argument("--digits", type=int, default=8, help="Number of digits for passkey mode")
     parser.add_argument("--format", choices=("chat", "completion"), default="chat")
     parser.add_argument("--system-prompt", default="", help="Optional system prompt for chat mode")
     parser.add_argument("--intro", default=DEFAULT_INTRO, help="Instruction text placed before the haystack")

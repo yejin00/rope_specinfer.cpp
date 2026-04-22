@@ -35,6 +35,18 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool pre_rope;
+    bool hadamard;
+    bool measure_kv_sensitivity;
+
+    uint32_t hadamard_seed;
+    enum llama_hadamard_granularity hadamard_granularity;
+    int32_t sensitivity_layer;
+    enum ggml_type sensitivity_baseline_type;
+    enum ggml_type sensitivity_probe_type;
+    enum ggml_type sensitivity_baseline_k_type;
+    enum ggml_type sensitivity_baseline_v_type;
+    enum ggml_type sensitivity_probe_k_type;
+    enum ggml_type sensitivity_probe_v_type;
 
     enum llama_pooling_type pooling_type;
 

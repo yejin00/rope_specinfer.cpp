@@ -3,14 +3,277 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-hadamard.h"
+#include "llama-kv-sensitivity.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 
+#include <array>
+#include <cctype>
 #include <cinttypes>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <utility>
+
+namespace {
+
+static std::string kv_layer_type_trim(const std::string & str) {
+    size_t start = 0;
+    size_t end = str.size();
+
+    while (start < end && std::isspace(static_cast<unsigned char>(str[start]))) {
+        ++start;
+    }
+    while (end > start && std::isspace(static_cast<unsigned char>(str[end - 1]))) {
+        --end;
+    }
+
+    return str.substr(start, end - start);
+}
+
+static const std::array<ggml_type, 16> & kv_layer_supported_types() {
+    static const std::array<ggml_type, 16> types = {
+        GGML_TYPE_F32,
+        GGML_TYPE_F16,
+        GGML_TYPE_BF16,
+        GGML_TYPE_Q8_0,
+        GGML_TYPE_Q4_0,
+        GGML_TYPE_Q4_0_HEAD,
+        GGML_TYPE_Q2_0_HEAD,
+        GGML_TYPE_Q3_0_HEAD,
+        GGML_TYPE_Q8_0_HEAD,
+        GGML_TYPE_Q2_0,
+        GGML_TYPE_Q4_0_Q2_0_HEAD,
+        GGML_TYPE_Q2_0_Q4_0_HEAD,
+        GGML_TYPE_Q4_1,
+        GGML_TYPE_IQ4_NL,
+        GGML_TYPE_Q5_0,
+        GGML_TYPE_Q5_1,
+    };
+
+    return types;
+}
+
+static std::string kv_layer_supported_types_str() {
+    std::string res;
+
+    for (size_t i = 0; i < kv_layer_supported_types().size(); ++i) {
+        if (!res.empty()) {
+            res += ", ";
+        }
+        res += ggml_type_name(kv_layer_supported_types()[i]);
+    }
+
+    return res;
+}
+
+static ggml_type kv_layer_type_from_str(const std::string & type_name) {
+    for (const auto type : kv_layer_supported_types()) {
+        if (type_name == ggml_type_name(type)) {
+            return type;
+        }
+    }
+
+    throw std::runtime_error(format(
+            "unsupported KV cache type '%s' (allowed: %s)",
+            type_name.c_str(), kv_layer_supported_types_str().c_str()));
+}
+
+static std::vector<std::string> split_kv_layer_spec_parts(const std::string & spec) {
+    std::vector<std::string> parts;
+
+    size_t start = 0;
+    for (size_t i = 0; i <= spec.size(); ++i) {
+        if (i != spec.size() && spec[i] != ',') {
+            continue;
+        }
+
+        parts.push_back(kv_layer_type_trim(spec.substr(start, i - start)));
+        start = i + 1;
+    }
+
+    return parts;
+}
+
+static std::string join_kv_layer_spec_parts(const std::vector<std::string> & parts) {
+    std::string res;
+
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (i > 0) {
+            res += ",";
+        }
+        res += parts[i];
+    }
+
+    return res;
+}
+
+static std::vector<std::string> split_kv_layer_spec_entries(const std::string & spec, const char * tensor_name) {
+    std::vector<std::string> entries;
+    std::vector<std::string> pending;
+
+    for (const auto & part : split_kv_layer_spec_parts(spec)) {
+        if (part.empty()) {
+            throw std::runtime_error(format(
+                    "malformed %s layer type spec '%s': empty entry",
+                    tensor_name, spec.c_str()));
+        }
+
+        pending.push_back(part);
+
+        if (part.find(':') != std::string::npos) {
+            entries.push_back(join_kv_layer_spec_parts(pending));
+            pending.clear();
+        }
+    }
+
+    if (!pending.empty()) {
+        throw std::runtime_error(format(
+                "malformed %s layer type spec '%s': missing type for layer selector '%s'",
+                tensor_name, spec.c_str(), join_kv_layer_spec_parts(pending).c_str()));
+    }
+
+    return entries;
+}
+
+static uint32_t parse_kv_layer_index(const std::string & token, const char * tensor_name, const std::string & spec) {
+    const std::string value = kv_layer_type_trim(token);
+
+    if (value.empty() || value.front() == '-') {
+        throw std::runtime_error(format(
+                "malformed %s layer type spec '%s': invalid layer index '%s'",
+                tensor_name, spec.c_str(), value.c_str()));
+    }
+
+    size_t pos = 0;
+    unsigned long long il = 0;
+
+    try {
+        il = std::stoull(value, &pos);
+    } catch (const std::exception &) {
+        throw std::runtime_error(format(
+                "malformed %s layer type spec '%s': invalid layer index '%s'",
+                tensor_name, spec.c_str(), value.c_str()));
+    }
+
+    if (pos != value.size() || il > std::numeric_limits<uint32_t>::max()) {
+        throw std::runtime_error(format(
+                "malformed %s layer type spec '%s': invalid layer index '%s'",
+                tensor_name, spec.c_str(), value.c_str()));
+    }
+
+    return static_cast<uint32_t>(il);
+}
+
+static std::vector<uint32_t> parse_kv_layer_selector(const std::string & selector, const char * tensor_name, const std::string & spec) {
+    std::vector<uint32_t> layers;
+
+    for (const auto & part : split_kv_layer_spec_parts(selector)) {
+        if (part.empty()) {
+            throw std::runtime_error(format(
+                    "malformed %s layer type spec '%s': empty layer selector",
+                    tensor_name, spec.c_str()));
+        }
+
+        const size_t dash = part.find('-');
+        if (dash == std::string::npos) {
+            layers.push_back(parse_kv_layer_index(part, tensor_name, spec));
+            continue;
+        }
+
+        if (part.find('-', dash + 1) != std::string::npos) {
+            throw std::runtime_error(format(
+                    "malformed %s layer type spec '%s': invalid layer range '%s'",
+                    tensor_name, spec.c_str(), part.c_str()));
+        }
+
+        const std::string start_str = kv_layer_type_trim(part.substr(0, dash));
+        const std::string end_str   = kv_layer_type_trim(part.substr(dash + 1));
+
+        if (start_str.empty() || end_str.empty()) {
+            throw std::runtime_error(format(
+                    "malformed %s layer type spec '%s': invalid layer range '%s'",
+                    tensor_name, spec.c_str(), part.c_str()));
+        }
+
+        const uint32_t il0 = parse_kv_layer_index(start_str, tensor_name, spec);
+        const uint32_t il1 = parse_kv_layer_index(end_str,   tensor_name, spec);
+
+        if (il0 > il1) {
+            throw std::runtime_error(format(
+                    "malformed %s layer type spec '%s': invalid layer range '%s'",
+                    tensor_name, spec.c_str(), part.c_str()));
+        }
+
+        for (uint32_t il = il0; il <= il1; ++il) {
+            layers.push_back(il);
+        }
+    }
+
+    return layers;
+}
+
+static std::vector<ggml_type> resolve_kv_layer_types(
+        const llama_hparams & hparams,
+        ggml_type fallback_type,
+        const char * spec_cstr,
+        const char * tensor_name) {
+    std::vector<ggml_type> layer_types(hparams.n_layer, fallback_type);
+
+    if (spec_cstr == nullptr) {
+        return layer_types;
+    }
+
+    const std::string spec = kv_layer_type_trim(spec_cstr);
+    if (spec.empty()) {
+        throw std::runtime_error(format("empty %s layer type spec", tensor_name));
+    }
+
+    std::vector<bool> assigned(hparams.n_layer, false);
+
+    for (const auto & entry : split_kv_layer_spec_entries(spec, tensor_name)) {
+        const size_t colon = entry.find(':');
+        if (colon == std::string::npos || entry.find(':', colon + 1) != std::string::npos) {
+            throw std::runtime_error(format(
+                    "malformed %s layer type spec '%s': invalid entry '%s'",
+                    tensor_name, spec.c_str(), entry.c_str()));
+        }
+
+        const std::string selector  = kv_layer_type_trim(entry.substr(0, colon));
+        const std::string type_name = kv_layer_type_trim(entry.substr(colon + 1));
+
+        if (selector.empty() || type_name.empty()) {
+            throw std::runtime_error(format(
+                    "malformed %s layer type spec '%s': invalid entry '%s'",
+                    tensor_name, spec.c_str(), entry.c_str()));
+        }
+
+        const ggml_type type = kv_layer_type_from_str(type_name);
+
+        for (const uint32_t il : parse_kv_layer_selector(selector, tensor_name, spec)) {
+            if (il >= hparams.n_layer) {
+                throw std::runtime_error(format(
+                        "%s layer type spec refers to layer %u, but model only has %u layers",
+                        tensor_name, il, hparams.n_layer));
+            }
+
+            if (assigned[il]) {
+                throw std::runtime_error(format(
+                        "%s layer %u is specified more than once in '%s'",
+                        tensor_name, il, spec.c_str()));
+            }
+
+            assigned[il] = true;
+            layer_types[il] = type;
+        }
+    }
+
+    return layer_types;
+}
+
+} // namespace
 
 //
 // llama_context
@@ -105,6 +368,31 @@ llama_context::llama_context(
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
     cparams.pre_rope   = params.pre_rope;
+    cparams.hadamard   = params.hadamard;
+    cparams.measure_kv_sensitivity = params.measure_kv_sensitivity;
+    cparams.hadamard_seed = params.hadamard_seed;
+    cparams.hadamard_granularity = params.hadamard_granularity;
+    cparams.sensitivity_layer = params.sensitivity_layer;
+    cparams.sensitivity_baseline_type = params.sensitivity_baseline_type;
+    cparams.sensitivity_probe_type = params.sensitivity_probe_type;
+    cparams.sensitivity_baseline_k_type = params.sensitivity_baseline_k_type;
+    cparams.sensitivity_baseline_v_type = params.sensitivity_baseline_v_type;
+    cparams.sensitivity_probe_k_type = params.sensitivity_probe_k_type;
+    cparams.sensitivity_probe_v_type = params.sensitivity_probe_v_type;
+
+    if (cparams.hadamard && cparams.pre_rope) {
+        throw std::runtime_error("Hadamard rotation requires post-RoPE K storage; --hadamard and --pre-rope cannot be used together");
+    }
+
+    if (cparams.measure_kv_sensitivity && cparams.pre_rope) {
+        throw std::runtime_error("KV sensitivity measurement requires post-RoPE K storage; --measure-kv-sensitivity and --pre-rope cannot be used together");
+    }
+
+    if (params.measure_kv_sensitivity) {
+        if (!params.dump_attn_error || params.dump_attn_error[0] == '\0') {
+            throw std::runtime_error("KV sensitivity measurement requires --dump-attn-error");
+        }
+    }
 
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
@@ -142,6 +430,8 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: causal_attn   = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn    = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified    = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
+    LLAMA_LOG_INFO("%s: hadamard      = %s\n",   __func__, cparams.hadamard ? "enabled" : "disabled");
+    LLAMA_LOG_INFO("%s: kv_sensitivity = %s\n",  __func__, cparams.measure_kv_sensitivity ? "enabled" : "disabled");
     LLAMA_LOG_INFO("%s: freq_base     = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale    = %g\n",   __func__, cparams.rope_freq_scale);
 
@@ -155,7 +445,52 @@ llama_context::llama_context(
                 __func__, cparams.n_ctx_seq, hparams.n_ctx_train);
     }
 
+    std::vector<ggml_type> layer_k_types;
+    std::vector<ggml_type> layer_v_types;
+
     if (!hparams.vocab_only) {
+        layer_k_types = resolve_kv_layer_types(hparams, params.type_k, params.kv_layer_k_types, "K");
+        layer_v_types = resolve_kv_layer_types(hparams, params.type_v, params.kv_layer_v_types, "V");
+    }
+
+    if (!hparams.vocab_only) {
+        if (cparams.measure_kv_sensitivity) {
+            const int32_t n_layer = hparams.n_layer;
+            if (cparams.sensitivity_layer < 0 || cparams.sensitivity_layer >= n_layer) {
+                throw std::runtime_error(format(
+                        "invalid sensitivity layer %d for model with %d layers",
+                        cparams.sensitivity_layer, n_layer));
+            }
+
+            kv_sensitivity = std::make_unique<llama_kv_sensitivity_state>(
+                    n_layer,
+                    cparams.sensitivity_layer,
+                    cparams.sensitivity_baseline_type,
+                    cparams.sensitivity_probe_type,
+                    cparams.sensitivity_baseline_k_type,
+                    cparams.sensitivity_baseline_v_type,
+                    cparams.sensitivity_probe_k_type,
+                    cparams.sensitivity_probe_v_type,
+                    params.dump_attn_error);
+
+            LLAMA_LOG_INFO("%s: kv_sensitivity layer=%d baseline(K=%s,V=%s) probe(K=%s,V=%s) dump=%s\n",
+                    __func__,
+                    cparams.sensitivity_layer,
+                    ggml_type_name(cparams.sensitivity_baseline_k_type),
+                    ggml_type_name(cparams.sensitivity_baseline_v_type),
+                    ggml_type_name(cparams.sensitivity_probe_k_type),
+                    ggml_type_name(cparams.sensitivity_probe_v_type),
+                    params.dump_attn_error);
+
+            if (cparams.warmup) {
+                LLAMA_LOG_WARN("%s: KV sensitivity measurement is best used with --no-warmup to avoid extra capture passes\n", __func__);
+            }
+        }
+
+        if (cparams.hadamard) {
+            hadamard = llama_hadamard_init(model, cparams);
+        }
+
         // GPU backends
         for (auto * dev : model.devices) {
             ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
@@ -214,9 +549,12 @@ llama_context::llama_context(
     // init the memory module
     if (!hparams.vocab_only) {
         llama_memory_params params_mem = {
-            /*.type_k   =*/ params.type_k,
-            /*.type_v   =*/ params.type_v,
-            /*.swa_full =*/ params.swa_full,
+            /*.type_k          =*/ params.type_k,
+            /*.type_v          =*/ params.type_v,
+            /*.layer_k_types   =*/ std::move(layer_k_types),
+            /*.layer_v_types   =*/ std::move(layer_v_types),
+            /*.flash_attn_type =*/ params.flash_attn_type,
+            /*.swa_full        =*/ params.swa_full,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -1790,7 +2128,7 @@ ggml_cgraph * llama_context::graph_reserve(uint32_t n_tokens, uint32_t n_seqs, u
 
     auto * res = gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, LLM_GRAPH_TYPE_DEFAULT);
+    const auto gparams = graph_params(res, ubatch, mctx, LLM_GRAPH_TYPE_DEFAULT, false);
 
     res->reset();
 
@@ -1813,7 +2151,8 @@ llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-            llm_graph_type   gtype) const {
+            llm_graph_type   gtype,
+                      bool   kv_sensitivity_active) const {
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
@@ -1824,6 +2163,9 @@ llm_graph_params llama_context::graph_params(
         /*.backend_cpu =*/ backend_cpu,
         /*.cvec        =*/ &cvec,
         /*.loras       =*/ &loras,
+        /*.hadamard    =*/ hadamard.get(),
+        /*.kv_sensitivity =*/ kv_sensitivity.get(),
+        /*.kv_sensitivity_active =*/ kv_sensitivity_active,
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.n_outputs   =*/ n_outputs,
@@ -2681,6 +3023,15 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.hadamard_seed               =*/ 0,
+        /*.hadamard_granularity        =*/ LLAMA_HADAMARD_GRANULARITY_HEAD,
+        /*.sensitivity_layer           =*/ -1,
+        /*.sensitivity_baseline_type   =*/ GGML_TYPE_Q4_0_HEAD,
+        /*.sensitivity_probe_type      =*/ GGML_TYPE_Q2_0_HEAD,
+        /*.sensitivity_baseline_k_type =*/ GGML_TYPE_Q4_0_HEAD,
+        /*.sensitivity_baseline_v_type =*/ GGML_TYPE_Q4_0_HEAD,
+        /*.sensitivity_probe_k_type    =*/ GGML_TYPE_Q2_0_HEAD,
+        /*.sensitivity_probe_v_type    =*/ GGML_TYPE_Q2_0_HEAD,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
@@ -2690,6 +3041,11 @@ llama_context_params llama_context_default_params() {
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
         /*.pre_rope                    =*/ false,
+        /*.hadamard                    =*/ false,
+        /*.measure_kv_sensitivity      =*/ false,
+        /*.kv_layer_k_types            =*/ nullptr,
+        /*.kv_layer_v_types            =*/ nullptr,
+        /*.dump_attn_error             =*/ nullptr,
     };
 
     return result;
@@ -2716,29 +3072,6 @@ llama_context * llama_init_from_model(
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && model->arch == LLM_ARCH_GROK) {
         LLAMA_LOG_WARN("%s: flash_attn is not compatible with Grok - forcing off\n", __func__);
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
-    }
-
-    if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO && ggml_is_quantized(params.type_k)) {
-        const uint32_t blck_size = ggml_blck_size(params.type_k);
-        if (model->hparams.n_embd_head_k % blck_size != 0) {
-            LLAMA_LOG_ERROR("%s: K cache type %s with block size %u does not divide n_embd_head_k=%u\n",
-                __func__, ggml_type_name(params.type_k), blck_size, model->hparams.n_embd_head_k);
-            return nullptr;
-        }
-    }
-
-    if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO && ggml_is_quantized(params.type_v)) {
-        const uint32_t blck_size = ggml_blck_size(params.type_v);
-        if (model->hparams.n_embd_head_v % blck_size != 0) {
-            LLAMA_LOG_ERROR("%s: V cache type %s with block size %u does not divide n_embd_head_k=%u\n",
-                __func__, ggml_type_name(params.type_v), blck_size, model->hparams.n_embd_head_v);
-            return nullptr;
-        }
-    }
-
-    if (ggml_is_quantized(params.type_v) && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
-        LLAMA_LOG_ERROR("%s: V cache quantization requires flash_attn\n", __func__);
-        return nullptr;
     }
 
     if (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED &&

@@ -96,6 +96,12 @@ typedef sycl::half2 ggml_half2;
 #define QI2_0 2
 #define QR2_0 2
 
+#define QI2_0_HEAD (QK2_0_HEAD / 16)
+#define QR2_0_HEAD 2
+
+#define QI3_0_HEAD (QK3_0_HEAD / (4 * QR3_0_HEAD))
+#define QR3_0_HEAD 2
+
 #define QI4_0 (QK4_0 / (4 * QR4_0))
 #define QR4_0 2
 
@@ -116,6 +122,9 @@ typedef sycl::half2 ggml_half2;
 
 #define QI8_0 (QK8_0 / (4 * QR8_0))
 #define QR8_0 1
+
+#define QI8_0_HEAD (QK8_0_HEAD / (4 * QR8_0_HEAD))
+#define QR8_0_HEAD 1
 
 #define QI8_1 (QK8_1 / (4 * QR8_1))
 #define QR8_1 1
@@ -193,6 +202,28 @@ typedef struct {
     uint8_t qs[QK4_0_HEAD / 2];   // nibbles / quants
 } block_q4_0_head;
 static_assert(sizeof(block_q4_0_head) == sizeof(ggml_half) + QK4_0_HEAD / 2, "wrong q4_0_head block size/padding");
+
+#define QK2_0_HEAD 128
+typedef struct {
+    ggml_half d;                  // delta
+    uint8_t qs[QK2_0_HEAD / 4];   // 2-bit quants, 4 values per byte
+} block_q2_0_head;
+static_assert(sizeof(block_q2_0_head) == sizeof(ggml_half) + QK2_0_HEAD / 4, "wrong q2_0_head block size/padding");
+
+#define QK3_0_HEAD 128
+typedef struct {
+    ggml_half d;                  // delta
+    uint8_t qs[QK3_0_HEAD / 4];   // low 2 bits, 4 values per byte
+    uint8_t qh[QK3_0_HEAD / 8];   // high bit, 8 values per byte
+} block_q3_0_head;
+static_assert(sizeof(block_q3_0_head) == sizeof(ggml_half) + QK3_0_HEAD / 4 + QK3_0_HEAD / 8, "wrong q3_0_head block size/padding");
+
+#define QK8_0_HEAD 128
+typedef struct {
+    ggml_half d;                // delta
+    int8_t qs[QK8_0_HEAD];      // quants
+} block_q8_0_head;
+static_assert(sizeof(block_q8_0_head) == sizeof(ggml_half) + QK8_0_HEAD, "wrong q8_0_head block size/padding");
 
 #define QK4_0_Q2_0_HEAD 128
 #define QR4_0_Q2_0_HEAD 2

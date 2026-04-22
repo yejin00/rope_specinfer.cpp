@@ -65,14 +65,143 @@ static void crs_scale_op(struct ggml_tensor * dst, const struct ggml_tensor * sr
     }
 }
 
+static void validate_kv_cache_type(
+        ggml_type type,
+        llama_flash_attn_type flash_attn_type,
+        uint32_t n_embd_head,
+        const char * tensor_name,
+        uint32_t il) {
+    if (flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO && ggml_is_quantized(type)) {
+        const uint32_t blck_size = ggml_blck_size(type);
+        if (n_embd_head % blck_size != 0) {
+            throw std::runtime_error(format(
+                    "%s cache type %s with block size %u does not divide %s head size %u at layer %u",
+                    tensor_name, ggml_type_name(type), blck_size, tensor_name, n_embd_head, il));
+        }
+    }
+
+    if (tensor_name[0] == 'V' && ggml_is_quantized(type) && flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+        throw std::runtime_error(format(
+                "V cache type %s requires flash_attn (layer %u)",
+                ggml_type_name(type), il));
+    }
+}
+
+static bool kv_cache_flash_attn_supports_type_pair(ggml_type type_k, ggml_type type_v) {
+    if (type_k == type_v) {
+        return true;
+    }
+
+    switch (type_k) {
+        case GGML_TYPE_F16:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+            switch (type_v) {
+                case GGML_TYPE_F16:
+                case GGML_TYPE_Q4_0:
+                case GGML_TYPE_Q4_1:
+                case GGML_TYPE_Q5_0:
+                case GGML_TYPE_Q5_1:
+                case GGML_TYPE_Q8_0:
+                    return true;
+                default:
+                    return false;
+            }
+
+        case GGML_TYPE_Q4_0_HEAD:
+            return type_v == GGML_TYPE_Q2_0_HEAD || type_v == GGML_TYPE_Q3_0_HEAD ||
+                   type_v == GGML_TYPE_Q8_0_HEAD || type_v == GGML_TYPE_Q2_0_Q4_0_HEAD;
+
+        case GGML_TYPE_Q2_0_HEAD:
+            return type_v == GGML_TYPE_Q3_0_HEAD || type_v == GGML_TYPE_Q4_0_HEAD;
+
+        case GGML_TYPE_Q3_0_HEAD:
+            return type_v == GGML_TYPE_Q2_0_HEAD;
+
+        case GGML_TYPE_Q2_0_Q4_0_HEAD:
+            return type_v == GGML_TYPE_Q2_0_HEAD || type_v == GGML_TYPE_Q3_0_HEAD ||
+                   type_v == GGML_TYPE_Q4_0 || type_v == GGML_TYPE_Q4_0_HEAD ||
+                   type_v == GGML_TYPE_Q8_0_HEAD;
+
+        default:
+            return false;
+    }
+}
+
+static void validate_kv_cache_type_pair(
+        ggml_type type_k,
+        ggml_type type_v,
+        llama_flash_attn_type flash_attn_type,
+        uint32_t il) {
+    if (flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+        return;
+    }
+
+    if (!ggml_is_quantized(type_k) && !ggml_is_quantized(type_v)) {
+        return;
+    }
+
+    if (kv_cache_flash_attn_supports_type_pair(type_k, type_v)) {
+        return;
+    }
+
+    throw std::runtime_error(format(
+            "unsupported KV cache type pair at layer %u for flash_attn=%s: K=%s, V=%s "
+            "(supported mixed head-wise pairs are q4_0_head/q2_0_head, q4_0_head/q3_0_head, "
+            "q4_0_head/q8_0_head, "
+            "q2_0_head/q4_0_head, q2_0_head/q3_0_head, q3_0_head/q2_0_head, "
+            "q4_0_head/q2_0_q4_0_head, "
+            "q2_0_q4_0_head/q2_0_head, q2_0_q4_0_head/q3_0_head, q2_0_q4_0_head/q4_0_head, "
+            "q2_0_q4_0_head/q8_0_head, "
+            "q2_0_q4_0_head/q4_0, plus equal-type pairs)",
+            il,
+            llama_flash_attn_type_name(flash_attn_type),
+            ggml_type_name(type_k),
+            ggml_type_name(type_v)));
+}
+
+static std::string summarize_kv_cache_layer_types(
+        const llama_hparams & hparams,
+        const std::vector<ggml_type> & layer_types,
+        const llama_memory_i::layer_filter_cb & filter) {
+    bool has_type = false;
+    ggml_type type = GGML_TYPE_COUNT;
+
+    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+        if (!hparams.has_kv(il)) {
+            continue;
+        }
+
+        if (filter && !filter(il)) {
+            continue;
+        }
+
+        if (!has_type) {
+            type = layer_types.at(il);
+            has_type = true;
+            continue;
+        }
+
+        if (type != layer_types.at(il)) {
+            return "mixed";
+        }
+    }
+
+    return has_type ? ggml_type_name(type) : "n/a";
+}
+
 //
 // llama_kv_cache
 //
 
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
-                ggml_type   type_k,
-                ggml_type   type_v,
+        const std::vector<ggml_type> & layer_types_k,
+        const std::vector<ggml_type> & layer_types_v,
+         llama_flash_attn_type   flash_attn_type,
                      bool   v_trans,
                      bool   offload,
                      bool   unified,
@@ -87,6 +216,12 @@ llama_kv_cache::llama_kv_cache(
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type) {
 
     GGML_ASSERT(kv_size % n_pad == 0);
+
+    if (layer_types_k.size() != hparams.n_layer || layer_types_v.size() != hparams.n_layer) {
+        throw std::runtime_error(format(
+                "invalid layer-wise KV cache type array size: K=%zu, V=%zu, expected=%u",
+                layer_types_k.size(), layer_types_v.size(), hparams.n_layer));
+    }
 
     const uint32_t n_layer_kv = hparams.n_layer_kv();
 
@@ -163,6 +298,8 @@ llama_kv_cache::llama_kv_cache(
         // [TAG_V_CACHE_VARIABLE]
         const uint32_t n_embd_k_gqa =            hparams.n_embd_k_gqa(il);
         const uint32_t n_embd_v_gqa = !v_trans ? hparams.n_embd_v_gqa(il) : hparams.n_embd_v_gqa_max();
+        const ggml_type type_k = layer_types_k[il];
+        const ggml_type type_v = layer_types_v[il];
 
         const char * dev_name = "CPU";
 
@@ -176,6 +313,10 @@ llama_kv_cache::llama_kv_cache(
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
+
+        validate_kv_cache_type(type_k, flash_attn_type, hparams.n_embd_head_k, "K", il);
+        validate_kv_cache_type(type_v, flash_attn_type, hparams.n_embd_head_v, "V", il);
+        validate_kv_cache_type_pair(type_k, type_v, flash_attn_type, il);
 
         ggml_context * ctx = ctx_for_buft(buft);
         if (!ctx) {
@@ -199,6 +340,9 @@ llama_kv_cache::llama_kv_cache(
         map_layer_ids[il] = layers.size();
 
         layers.push_back({ il, k, v, k_stream, v_stream, });
+
+        LLAMA_LOG_INFO("%s: layer %3d: K=%s, V=%s\n",
+                __func__, il, ggml_type_name(type_k), ggml_type_name(type_v));
     }
 
     if (reuse) {
@@ -217,11 +361,22 @@ llama_kv_cache::llama_kv_cache(
                 continue;
             }
 
+            if (layer_types_k[il] != layer_types_k[il_reuse] || layer_types_v[il] != layer_types_v[il_reuse]) {
+                throw std::runtime_error(format(
+                        "layer %u reuses layer %d KV cache, but requested types differ: K=%s/V=%s vs K=%s/V=%s",
+                        il, il_reuse,
+                        ggml_type_name(layer_types_k[il]),     ggml_type_name(layer_types_v[il]),
+                        ggml_type_name(layer_types_k[il_reuse]), ggml_type_name(layer_types_v[il_reuse])));
+            }
+
             GGML_ASSERT(map_layer_ids.find(il_reuse) != map_layer_ids.end());
 
             map_layer_ids[il] = map_layer_ids[il_reuse];
 
             LLAMA_LOG_DEBUG("%s: - layer %3d: reuse layer %d, is_swa = %d\n", __func__, il, il_reuse, hparams.is_swa(il));
+            LLAMA_LOG_INFO("%s: layer %3d: reuse layer %d, K=%s, V=%s\n",
+                    __func__, il, il_reuse,
+                    ggml_type_name(layer_types_k[il]), ggml_type_name(layer_types_v[il]));
         }
     }
 
@@ -241,11 +396,13 @@ llama_kv_cache::llama_kv_cache(
     {
         const size_t memory_size_k = size_k_bytes();
         const size_t memory_size_v = size_v_bytes();
+        const std::string type_k_summary = summarize_kv_cache_layer_types(hparams, layer_types_k, filter);
+        const std::string type_v_summary = summarize_kv_cache_layer_types(hparams, layer_types_v, filter);
 
         LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u/%u seqs), K (%s): %7.2f MiB, V (%s): %7.2f MiB\n", __func__,
                 (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f), kv_size, (int) layers.size(), n_seq_max, n_stream,
-                ggml_type_name(type_k), (float)memory_size_k / (1024.0f * 1024.0f),
-                ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
+                type_k_summary.c_str(), (float)memory_size_k / (1024.0f * 1024.0f),
+                type_v_summary.c_str(), (float)memory_size_v / (1024.0f * 1024.0f));
     }
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");

@@ -573,6 +573,21 @@ static void dequantize_row_q4_0_head_cuda(const void * vx, dst_t * y, const int6
 }
 
 template<typename dst_t>
+static void dequantize_row_q2_0_head_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    dequantize_block_cont_cuda<QK2_0_HEAD, QR2_0_HEAD, dequantize_q2_0_head>(vx, y, k, stream);
+}
+
+template<typename dst_t>
+static void dequantize_row_q3_0_head_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    dequantize_block_cont_cuda<QK3_0_HEAD, QR3_0_HEAD, dequantize_q3_0_head>(vx, y, k, stream);
+}
+
+template<typename dst_t>
+static void dequantize_row_q8_0_head_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    dequantize_block_cont_cuda<QK8_0_HEAD, QR8_0_HEAD, dequantize_q8_0_head>(vx, y, k, stream);
+}
+
+template<typename dst_t>
 static void dequantize_row_q4_0_q2_0_head_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     dequantize_block_cont_cuda<QK4_0_Q2_0_HEAD, QR4_0_Q2_0_HEAD, dequantize_q4_0_q2_0_head>(vx, y, k, stream);
 }
@@ -714,6 +729,12 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_q4_0_cuda;
         case GGML_TYPE_Q4_0_HEAD:
             return dequantize_row_q4_0_head_cuda;
+        case GGML_TYPE_Q2_0_HEAD:
+            return dequantize_row_q2_0_head_cuda;
+        case GGML_TYPE_Q3_0_HEAD:
+            return dequantize_row_q3_0_head_cuda;
+        case GGML_TYPE_Q8_0_HEAD:
+            return dequantize_row_q8_0_head_cuda;
         case GGML_TYPE_Q4_0_Q2_0_HEAD:
             return dequantize_row_q4_0_q2_0_head_cuda;
         case GGML_TYPE_Q2_0_Q4_0_HEAD:
@@ -776,6 +797,12 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_q4_0_cuda;
         case GGML_TYPE_Q4_0_HEAD:
             return dequantize_row_q4_0_head_cuda;
+        case GGML_TYPE_Q2_0_HEAD:
+            return dequantize_row_q2_0_head_cuda;
+        case GGML_TYPE_Q3_0_HEAD:
+            return dequantize_row_q3_0_head_cuda;
+        case GGML_TYPE_Q8_0_HEAD:
+            return dequantize_row_q8_0_head_cuda;
         case GGML_TYPE_Q4_0_Q2_0_HEAD:
             return dequantize_row_q4_0_q2_0_head_cuda;
         case GGML_TYPE_Q2_0_Q4_0_HEAD:
@@ -837,6 +864,12 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK4_0, QR4_0, dequantize_q4_0>;
         case GGML_TYPE_Q4_0_HEAD:
             return dequantize_block_cuda<QK4_0_HEAD, QR4_0_HEAD, dequantize_q4_0_head>;
+        case GGML_TYPE_Q2_0_HEAD:
+            return dequantize_block_cuda<QK2_0_HEAD, QR2_0_HEAD, dequantize_q2_0_head>;
+        case GGML_TYPE_Q3_0_HEAD:
+            return dequantize_block_cuda<QK3_0_HEAD, QR3_0_HEAD, dequantize_q3_0_head>;
+        case GGML_TYPE_Q8_0_HEAD:
+            return dequantize_block_cuda<QK8_0_HEAD, QR8_0_HEAD, dequantize_q8_0_head>;
         case GGML_TYPE_Q4_0_Q2_0_HEAD:
             return dequantize_block_cuda<QK4_0_Q2_0_HEAD, QR4_0_Q2_0_HEAD, dequantize_q4_0_q2_0_head>;
         case GGML_TYPE_Q2_0_Q4_0_HEAD:
@@ -866,6 +899,12 @@ to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK4_0, QR4_0, dequantize_q4_0>;
         case GGML_TYPE_Q4_0_HEAD:
             return dequantize_block_cuda<QK4_0_HEAD, QR4_0_HEAD, dequantize_q4_0_head>;
+        case GGML_TYPE_Q2_0_HEAD:
+            return dequantize_block_cuda<QK2_0_HEAD, QR2_0_HEAD, dequantize_q2_0_head>;
+        case GGML_TYPE_Q3_0_HEAD:
+            return dequantize_block_cuda<QK3_0_HEAD, QR3_0_HEAD, dequantize_q3_0_head>;
+        case GGML_TYPE_Q8_0_HEAD:
+            return dequantize_block_cuda<QK8_0_HEAD, QR8_0_HEAD, dequantize_q8_0_head>;
         case GGML_TYPE_Q4_0_Q2_0_HEAD:
             return dequantize_block_cuda<QK4_0_Q2_0_HEAD, QR4_0_Q2_0_HEAD, dequantize_q4_0_q2_0_head>;
         case GGML_TYPE_Q2_0_Q4_0_HEAD:
@@ -895,6 +934,12 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK4_0, QR4_0, dequantize_q4_0>;
         case GGML_TYPE_Q4_0_HEAD:
             return dequantize_block_cuda<QK4_0_HEAD, QR4_0_HEAD, dequantize_q4_0_head>;
+        case GGML_TYPE_Q2_0_HEAD:
+            return dequantize_block_cuda<QK2_0_HEAD, QR2_0_HEAD, dequantize_q2_0_head>;
+        case GGML_TYPE_Q3_0_HEAD:
+            return dequantize_block_cuda<QK3_0_HEAD, QR3_0_HEAD, dequantize_q3_0_head>;
+        case GGML_TYPE_Q8_0_HEAD:
+            return dequantize_block_cuda<QK8_0_HEAD, QR8_0_HEAD, dequantize_q8_0_head>;
         case GGML_TYPE_Q4_0_Q2_0_HEAD:
             return dequantize_block_cuda<QK4_0_Q2_0_HEAD, QR4_0_Q2_0_HEAD, dequantize_q4_0_q2_0_head>;
         case GGML_TYPE_Q2_0_Q4_0_HEAD:
