@@ -11,11 +11,18 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
+
+try:
+    from rouge import Rouge
+except ImportError:
+    Rouge = None
+
+ROUGE_FALLBACK_WARNED = False
 
 
 LONG_BENCH_E_TASKS = [
@@ -51,19 +58,19 @@ TASK_CATEGORIES = {
 }
 
 TASK_METRICS = {
-    "qasper": "f1",
-    "multifieldqa_en": "f1",
-    "hotpotqa": "f1",
-    "2wikimqa": "f1",
+    "qasper": "qa_f1",
+    "multifieldqa_en": "qa_f1",
+    "hotpotqa": "qa_f1",
+    "2wikimqa": "qa_f1",
     "gov_report": "rouge_l",
     "multi_news": "rouge_l",
-    "trec": "accuracy",
-    "triviaqa": "f1",
+    "trec": "classification",
+    "triviaqa": "qa_f1",
     "samsum": "rouge_l",
-    "passage_count": "accuracy",
-    "passage_retrieval_en": "accuracy",
-    "lcc": "edit_sim",
-    "repobench-p": "edit_sim",
+    "passage_count": "count",
+    "passage_retrieval_en": "retrieval",
+    "lcc": "code_sim",
+    "repobench-p": "code_sim",
 }
 
 TASK_MAX_NEW_TOKENS = {
@@ -82,6 +89,9 @@ TASK_MAX_NEW_TOKENS = {
     "repobench-p": 96,
 }
 
+FIRST_LINE_TASKS = {"trec", "triviaqa", "samsum", "lsht"}
+LENGTH_BUCKETS = ("0-4k", "4-8k", "8k+")
+
 
 @dataclass
 class PredictionRecord:
@@ -92,7 +102,9 @@ class PredictionRecord:
     sample_id: str
     prediction_raw: str
     prediction_text: str
+    prediction_for_scoring: str
     references: List[str]
+    all_classes: List[str]
     score: float
     correct: Optional[bool]
     prompt_tokens: int
@@ -138,6 +150,13 @@ class ServerClient:
         while time.time() < deadline:
             try:
                 self.request_json("GET", "/health")
+                # /health can return before the model finishes loading; require a
+                # lightweight inference-related endpoint to succeed as well.
+                self.request_json(
+                    "POST",
+                    "/tokenize",
+                    {"content": "", "add_special": True},
+                )
                 return
             except RuntimeError as exc:
                 last_error = exc
@@ -210,6 +229,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--api-key", default="", help="Optional llama-server API key")
     parser.add_argument("--hf-repo", default="THUDM/LongBench", help="HF dataset repo for LongBench")
     parser.add_argument("--verbose", action="store_true", help="Print every sample as it finishes")
+    parser.add_argument("--quiet", action="store_true", help="Suppress task/sample progress logs")
     parser.add_argument("--repo-root", default=str(repo_root_default), help="Unused placeholder for symmetry with other scripts")
     return parser.parse_args(argv)
 
@@ -223,7 +243,7 @@ def load_task_dataset(hf_repo: str, task: str):
         ) from exc
 
     dataset_name = f"{task}_e"
-    ds = load_dataset(hf_repo, dataset_name, split="test")
+    ds = load_dataset(hf_repo, dataset_name, split="test", trust_remote_code=True)
     return [dict(row) for row in ds]
 
 
@@ -320,7 +340,7 @@ def strip_special_tokens(text: str) -> str:
     return text.strip()
 
 
-def normalize_qa_answer(text: str) -> str:
+def normalize_answer(text: str) -> str:
     text = text.lower()
     text = re.sub(r"\b(a|an|the)\b", " ", text)
     text = "".join(ch for ch in text if ch not in string.punctuation)
@@ -328,30 +348,20 @@ def normalize_qa_answer(text: str) -> str:
     return text
 
 
-def token_f1(prediction: str, reference: str) -> float:
-    pred_tokens = normalize_qa_answer(prediction).split()
-    ref_tokens = normalize_qa_answer(reference).split()
-    if not pred_tokens and not ref_tokens:
-        return 1.0
-    if not pred_tokens or not ref_tokens:
+def f1_score(prediction_tokens: List[str], reference_tokens: List[str]) -> float:
+    common = Counter(prediction_tokens) & Counter(reference_tokens)
+    num_same = sum(common.values())
+    if num_same == 0:
         return 0.0
+    precision = 1.0 * num_same / len(prediction_tokens)
+    recall = 1.0 * num_same / len(reference_tokens)
+    return (2 * precision * recall) / (precision + recall)
 
-    common = defaultdict(int)
-    for token in ref_tokens:
-        common[token] += 1
 
-    overlap = 0
-    for token in pred_tokens:
-        if common[token] > 0:
-            overlap += 1
-            common[token] -= 1
-
-    if overlap == 0:
-        return 0.0
-
-    precision = overlap / len(pred_tokens)
-    recall = overlap / len(ref_tokens)
-    return 2 * precision * recall / (precision + recall)
+def qa_f1_score(prediction: str, reference: str, **_: Any) -> float:
+    pred_tokens = normalize_answer(prediction).split()
+    ref_tokens = normalize_answer(reference).split()
+    return f1_score(pred_tokens, ref_tokens)
 
 
 def lcs_length(xs: List[str], ys: List[str]) -> int:
@@ -387,35 +397,126 @@ def rouge_l_f1(prediction: str, reference: str) -> float:
     return 2 * precision * recall / (precision + recall)
 
 
-def normalized_exact_match(prediction: str, reference: str) -> bool:
-    pred_norm = normalize_qa_answer(prediction)
-    ref_norm = normalize_qa_answer(reference)
-    return pred_norm == ref_norm
+def rouge_score(prediction: str, reference: str, **_: Any) -> float:
+    global ROUGE_FALLBACK_WARNED
+    if Rouge is not None:
+        scorer = Rouge()
+        try:
+            scores = scorer.get_scores([prediction], [reference], avg=True)
+        except Exception:
+            return 0.0
+        return float(scores["rouge-l"]["f"])
+    if not ROUGE_FALLBACK_WARNED:
+        print(
+            "[longbench-e] warning: `rouge` is not installed; using built-in Rouge-L fallback instead.",
+            file=sys.stderr,
+            flush=True,
+        )
+        ROUGE_FALLBACK_WARNED = True
+    return rouge_l_f1(prediction, reference)
 
 
-def code_edit_similarity(prediction: str, reference: str) -> float:
-    return SequenceMatcher(None, prediction.strip(), reference.strip()).ratio()
+def count_score(prediction: str, reference: str, **_: Any) -> float:
+    numbers = re.findall(r"\d+", prediction)
+    right_num = 0
+    for number in numbers:
+        if str(number) == str(reference):
+            right_num += 1
+    return 0.0 if not numbers else float(right_num / len(numbers))
 
 
-def score_prediction(task: str, prediction: str, references: List[str]) -> float:
-    metric = TASK_METRICS[task]
+def retrieval_score(prediction: str, reference: str, **_: Any) -> float:
+    matches = re.findall(r"Paragraph (\d+)", reference)
+    if not matches:
+        return 0.0
+    reference_id = matches[0]
+    numbers = re.findall(r"\d+", prediction)
+    right_num = 0
+    for number in numbers:
+        if str(number) == str(reference_id):
+            right_num += 1
+    return 0.0 if not numbers else float(right_num / len(numbers))
+
+
+def _sequence_match_ratio(a: str, b: str) -> float:
+    return int(round(100 * SequenceMatcher(None, a, b).ratio())) / 100.0
+
+
+def code_sim_score(prediction: str, reference: str, **_: Any) -> float:
+    candidate = ""
+    for line in prediction.lstrip("\n").split("\n"):
+        if ("`" not in line) and ("#" not in line) and ("//" not in line):
+            candidate = line
+            break
+    return _sequence_match_ratio(candidate, reference)
+
+
+def classification_score(prediction: str, reference: str, **kwargs: Any) -> float:
+    em_match_list = []
+    all_classes = kwargs.get("all_classes") or []
+    for class_name in all_classes:
+        if class_name in prediction:
+            em_match_list.append(class_name)
+    for match_term in em_match_list:
+        if match_term in reference and match_term != reference:
+            em_match_list.remove(match_term)
+    # Match the upstream LongBench/KIVI scorer behavior.
+    if em_match_list != 0:
+        if reference in em_match_list:
+            return 1.0 / len(em_match_list)
+        return 0.0
+
+    best_match = None
+    highest_similarity = 0.0
+    for class_name in all_classes:
+        similarity = SequenceMatcher(None, class_name, prediction).ratio()
+        if similarity > highest_similarity:
+            highest_similarity = similarity
+            best_match = class_name
+    return float(best_match == reference)
+
+
+DATASET_TO_METRIC = {
+    "qasper": qa_f1_score,
+    "multifieldqa_en": qa_f1_score,
+    "hotpotqa": qa_f1_score,
+    "2wikimqa": qa_f1_score,
+    "gov_report": rouge_score,
+    "multi_news": rouge_score,
+    "trec": classification_score,
+    "triviaqa": qa_f1_score,
+    "samsum": rouge_score,
+    "passage_count": count_score,
+    "passage_retrieval_en": retrieval_score,
+    "lcc": code_sim_score,
+    "repobench-p": code_sim_score,
+}
+
+
+def prediction_for_scoring(task: str, prediction: str) -> str:
+    if task in FIRST_LINE_TASKS:
+        return prediction.lstrip("\n").split("\n")[0]
+    return prediction
+
+
+def score_prediction(task: str, prediction: str, references: List[str], all_classes: List[str]) -> float:
     if not references:
         return 0.0
 
-    if metric == "f1":
-        return max(token_f1(prediction, ref) for ref in references)
-    if metric == "rouge_l":
-        return max(rouge_l_f1(prediction, ref) for ref in references)
-    if metric == "accuracy":
-        return 1.0 if any(normalized_exact_match(prediction, ref) for ref in references) else 0.0
-    if metric == "edit_sim":
-        return max(code_edit_similarity(prediction, ref) for ref in references)
-
-    raise ValueError(f"unsupported metric: {metric}")
+    metric_fn = DATASET_TO_METRIC[task]
+    prepared_prediction = prediction_for_scoring(task, prediction)
+    score = 0.0
+    for reference in references:
+        score = max(score, metric_fn(prepared_prediction, reference, all_classes=all_classes))
+    return score
 
 
-def score_is_binary(task: str) -> bool:
-    return TASK_METRICS[task] == "accuracy"
+def is_strictly_correct(score: float) -> Optional[bool]:
+    if score == 1.0:
+        return True
+    if score == 0.0:
+        return False
+    return None
 
 
 def write_json(path: Path, payload: Any):
@@ -438,6 +539,42 @@ def write_csv(path: Path, rows: Sequence[Dict[str, Any]]):
         writer.writerows(rows)
 
 
+def official_prediction_row(record: PredictionRecord) -> Dict[str, Any]:
+    return {
+        "pred": record.prediction_text,
+        "answers": record.references,
+        "all_classes": record.all_classes,
+        "length": record.ctx_length,
+    }
+
+
+def bucket_for_length(length: Any) -> Optional[str]:
+    try:
+        length_value = int(length)
+    except (TypeError, ValueError):
+        return None
+    if length_value < 4000:
+        return "0-4k"
+    if length_value < 8000:
+        return "4-8k"
+    return "8k+"
+
+
+def scaled_mean(values: List[float]) -> float:
+    if not values:
+        return float("nan")
+    return round(100 * (sum(values) / len(values)), 2)
+
+
+def bucket_scores(records: Sequence[PredictionRecord]) -> Dict[str, float]:
+    scores: Dict[str, List[float]] = {bucket: [] for bucket in LENGTH_BUCKETS}
+    for record in records:
+        bucket = bucket_for_length(record.ctx_length)
+        if bucket is not None:
+            scores[bucket].append(record.score)
+    return {bucket: scaled_mean(values) for bucket, values in scores.items()}
+
+
 def evaluate_task(client: ServerClient, args: argparse.Namespace, task: str, output_root: Path):
     samples = load_task_dataset(args.hf_repo, task)
     if args.max_samples > 0:
@@ -446,6 +583,12 @@ def evaluate_task(client: ServerClient, args: argparse.Namespace, task: str, out
     records: List[PredictionRecord] = []
     category = TASK_CATEGORIES[task]
     metric = TASK_METRICS[task]
+
+    if not args.quiet:
+        print(
+            f"[longbench-e] task={task} samples={len(samples)} metric={metric}",
+            flush=True,
+        )
 
     for idx, sample in enumerate(samples):
         user_content = task_instruction(task, sample)
@@ -466,7 +609,9 @@ def evaluate_task(client: ServerClient, args: argparse.Namespace, task: str, out
         raw_text = normalize_text(response.get("content", ""))
         prediction = strip_special_tokens(raw_text)
         references = normalize_references(sample.get("answers"))
-        score = score_prediction(task, prediction, references)
+        all_classes = sample.get("all_classes") or []
+        prediction_scored = prediction_for_scoring(task, prediction)
+        score = score_prediction(task, prediction, references, all_classes)
 
         timings = response.get("timings", {})
         if not isinstance(timings, dict):
@@ -480,9 +625,11 @@ def evaluate_task(client: ServerClient, args: argparse.Namespace, task: str, out
             sample_id=str(sample.get("_id", idx)),
             prediction_raw=raw_text,
             prediction_text=prediction,
+            prediction_for_scoring=prediction_scored,
             references=references,
+            all_classes=list(all_classes),
             score=score,
-            correct=bool(score) if score_is_binary(task) else None,
+            correct=is_strictly_correct(score),
             prompt_tokens=prompt_tokens,
             prompt_chars=len(prompt),
             response_tokens=int(timings.get("predicted_n", 0) or 0),
@@ -498,13 +645,21 @@ def evaluate_task(client: ServerClient, args: argparse.Namespace, task: str, out
                 f"score={score:.4f} pred={prediction!r}",
                 flush=True,
             )
+        elif not args.quiet:
+            print(
+                f"[longbench-e] task={task} sample={idx + 1}/{len(samples)} "
+                f"score={score:.4f}",
+                flush=True,
+            )
 
     task_score = sum(record.score for record in records) / len(records) if records else 0.0
+    task_bucket_scores = bucket_scores(records)
     task_dir = output_root / task
     task_dir.mkdir(parents=True, exist_ok=True)
 
     prediction_rows = [asdict(record) for record in records]
     write_jsonl(task_dir / "predictions.jsonl", prediction_rows)
+    write_jsonl(task_dir / "official_predictions.jsonl", [official_prediction_row(record) for record in records])
     write_csv(task_dir / "predictions.csv", prediction_rows)
 
     task_result = {
@@ -514,12 +669,23 @@ def evaluate_task(client: ServerClient, args: argparse.Namespace, task: str, out
         "setting_name": args.setting_name,
         "num_samples": len(records),
         "score": task_score,
+        "score_pct": round(100 * task_score, 2),
+        "bucket_scores": task_bucket_scores,
         "files": {
             "predictions_jsonl": "predictions.jsonl",
+            "official_predictions_jsonl": "official_predictions.jsonl",
             "predictions_csv": "predictions.csv",
         },
     }
     write_json(task_dir / "results.json", task_result)
+
+    if not args.quiet:
+        print(
+            f"[longbench-e] finished task={task} score={100 * task_score:.2f} "
+            f"buckets={task_bucket_scores} n={len(records)} wrote={task_dir / 'results.json'}",
+            flush=True,
+        )
+
     return task_result, records
 
 
@@ -546,9 +712,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     task_results: List[Dict[str, Any]] = []
     all_predictions: List[Dict[str, Any]] = []
-    for task in args.tasks:
+    official_result: Dict[str, Dict[str, float]] = {}
+    total_tasks = len(args.tasks)
+    for task_index, task in enumerate(args.tasks, start=1):
+        if task not in LONG_BENCH_E_TASKS:
+            raise ValueError(
+                f"unsupported LongBench-E task: {task}. Allowed tasks: {', '.join(LONG_BENCH_E_TASKS)}"
+            )
+        if not args.quiet:
+            print(
+                f"[longbench-e] starting task={task} ({task_index}/{total_tasks})",
+                flush=True,
+            )
         result, records = evaluate_task(client, args, task, output_root)
         task_results.append(result)
+        official_result[task] = result["bucket_scores"]
         all_predictions.extend(asdict(record) for record in records)
 
     category_results, overall = aggregate(task_results)
@@ -558,10 +736,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "tasks": args.tasks,
         "task_results": task_results,
         "category_average": category_results,
+        "category_average_pct": {
+            category: round(100 * score, 2)
+            for category, score in category_results.items()
+        },
         "overall_average": overall,
+        "overall_average_pct": round(100 * overall, 2),
     }
 
     write_json(output_root / "summary.json", summary)
+    write_json(output_root / "result.json", official_result)
     write_csv(output_root / "task_results.csv", task_results)
     write_jsonl(output_root / "all_predictions.jsonl", all_predictions)
 
@@ -569,15 +753,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print("Task Scores")
     for result in task_results:
         print(
-            f"{result['task']:<22} metric={result['metric']:<8} "
-            f"score={result['score']:.4f} n={result['num_samples']}"
+            f"{result['task']:<22} metric={result['metric']:<14} "
+            f"score={result['score_pct']:.2f} buckets={result['bucket_scores']} n={result['num_samples']}"
         )
     print("")
     print("Category Averages")
     for category, score in category_results.items():
-        print(f"{category:<16} score={score:.4f}")
+        print(f"{category:<16} score={100 * score:.2f}")
     print("")
-    print(f"Overall Average: {overall:.4f}")
+    print(f"Overall Average: {100 * overall:.2f}")
+    print(f"wrote {output_root / 'result.json'}")
     print(f"wrote {output_root / 'summary.json'}")
     return 0
 
